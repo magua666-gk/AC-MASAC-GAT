@@ -1,0 +1,53 @@
+# Training commands
+
+# 1. Main experiment: MASAC + attention + curriculum learning
+python main_SAC_curriculum.py --experiment_type curriculum --use_curriculum
+
+# Optional: enable adaptive alpha instead of the default fixed alpha=1
+python main_SAC_curriculum.py --experiment_type curriculum --use_curriculum --adaptive_alpha
+
+# 2. Standard MASAC: no curriculum learning
+python main_SAC_curriculum.py --experiment_type standard
+
+# Standard MASAC with adaptive alpha
+python main_SAC_curriculum.py --experiment_type standard --adaptive_alpha
+
+# 3. Ablation: no attention, with curriculum learning
+python main_SAC_curriculum.py --experiment_type no_attention
+
+# 4. Ablation: attention, no curriculum learning
+python main_SAC_curriculum.py --experiment_type no_curriculum
+
+
+# Output layout
+
+# Training outputs:
+# outputs/train/<experiment>/<experiment>_train_<YYYYMMDD_HHMMSS>/
+#
+# Test outputs:
+# outputs/test/<experiment>/<experiment>_test_<YYYYMMDD_HHMMSS>/
+#
+# Curriculum model example:
+# outputs/train/curriculum/curriculum_train_20260511_153000/model/final/final_model_20260511_153000
+
+
+# Test commands
+
+# 5. H-CRRT baseline test
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render
+
+# Main experiment single-difficulty test.
+# If --model_path is omitted, the latest model under outputs/train/curriculum/ is selected automatically.
+python main_SAC_curriculum.py --experiment_type curriculum --test
+
+# Main experiment multi-difficulty test
+python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test
+
+# Main experiment test with an explicit timestamped model file
+python main_SAC_curriculum.py --experiment_type curriculum --test --model_path outputs/train/curriculum/<run_dir>/model/final/final_model_<timestamp>
+
+# no_attention test
+python main_SAC_curriculum.py --experiment_type no_attention --test --model_path outputs/train/no_attention/<run_dir>/model/final/final_model_<timestamp>
+
+# no_curriculum test
+python main_SAC_curriculum.py --experiment_type no_curriculum --test --model_path outputs/train/no_curriculum/<run_dir>/model/final/final_model_<timestamp>
