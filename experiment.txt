@@ -51,3 +51,12 @@ python main_SAC_curriculum.py --experiment_type no_attention --test --model_path
 
 # no_curriculum test
 python main_SAC_curriculum.py --experiment_type no_curriculum --test --model_path outputs/train/no_curriculum/<run_dir>/model/final/final_model_<timestamp>
+
+# 固定 alpha=1，对照组
+python main_SAC_curriculum.py --use_curriculum
+
+# 论文式自适应 alpha，但限制最大值
+python main_SAC_curriculum.py --use_curriculum --adaptive_alpha --target_entropy -0.1 --alpha_max 1.0
+
+# 更稳定的自适应 alpha
+python main_SAC_curriculum.py --use_curriculum --adaptive_alpha --target_entropy -2.0 --alpha_max 1.0

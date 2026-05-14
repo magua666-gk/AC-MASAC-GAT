@@ -55,7 +55,7 @@ class MASACController:
     def __init__(self, n_agents=1, state_dim=17, action_dim=4, memory_size=int(2e6), \
             batch_size=256, gamma=0.99, tau=0.01, value_lr=3e-4, policy_lr=1e-4, \
             hidden_dim=256, target_update_interval=2, reward_scale=0.1, \
-            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, device=None, 
+            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, alpha_min=0.01, alpha_max=1.0 ,device=None, 
             memory_capacity=None, max_replay_ratio=10.0):  # Add max_replay_ratio parameter
         """Initialize role-based MASAC controller
         
@@ -90,7 +90,15 @@ class MASACController:
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.auto_entropy = bool(auto_entropy)
         self.entropy_lr = entropy_lr # Save entropy_lr as instance attribute
+        self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
         
+        if self.alpha_min <= 0:
+            self.alpha_min = 1e-6
+        
+        if self.alpha_max < self.alpha_min:
+            raise ValueError(f"alpha_max({self.alpha_max}) must be >= alpha_min({self.alpha_min})")
+
         # Handle memory size parameter (backward compatible)
         if memory_capacity is not None:
             print(f"Warning: Deprecated parameter 'memory_capacity' used, please use 'memory_size' instead")
@@ -240,13 +248,19 @@ class MASACController:
         self.entroy_leader = MASACEntroy(action_dim=action_dim)
         self.entroy_follower = MASACEntroy(action_dim=action_dim)
         
+        # Set alpha clamp range
+        self.entroy_leader.min_alpha = self.alpha_min
+        self.entroy_leader.max_alpha = self.alpha_max
+        self.entroy_follower.min_alpha = self.alpha_min
+        self.entroy_follower.max_alpha = self.alpha_max
+        
         # Set target entropy
-        if target_entropy < 0:
-            self.entroy_leader.target_entropy = -0.1
-            self.entroy_follower.target_entropy = -0.1
-        else:
-            self.entroy_leader.target_entropy = target_entropy
-            self.entroy_follower.target_entropy = target_entropy
+        # 注意：不要再写 if target_entropy < 0 就强制改成 -0.1
+        # 否则你传 -2.0 也会被覆盖成 -0.1
+        target_entropy = float(target_entropy)
+        self.entroy_leader.target_entropy = target_entropy
+        self.entroy_follower.target_entropy = target_entropy
+        
         self._ensure_entropy_parameters()
         
         # === Initialize optimizers ===
@@ -393,7 +407,38 @@ class MASACController:
             entroy.log_alpha = current
         else:
             entroy.log_alpha = nn.Parameter(tensor, requires_grad=True)
-        entroy.alpha = entroy.log_alpha.detach().exp()
+        # 关键保护逻辑：
+        # 1）如果开启自适应 alpha，则按 alpha_min / alpha_max 裁剪
+        # 2）如果没有开启自适应 alpha，则强制 alpha = 1
+        if self.auto_entropy:
+            self._clamp_entropy_alpha(entroy, record_history=False)
+        else:
+            with torch.no_grad():
+                entroy.log_alpha.fill_(0.0)
+            entroy.alpha = entroy.log_alpha.detach().exp()
+    def _clamp_entropy_alpha(self, entroy, record_history=True):
+        """Clamp log_alpha so that alpha stays in [alpha_min, alpha_max]."""
+        min_alpha = float(getattr(entroy, 'min_alpha', self.alpha_min))
+        max_alpha = float(getattr(entroy, 'max_alpha', self.alpha_max))
+    
+        if min_alpha <= 0:
+            min_alpha = 1e-6
+    
+        if max_alpha < min_alpha:
+            max_alpha = min_alpha
+    
+        with torch.no_grad():
+            lower = float(np.log(min_alpha))
+            upper = float(np.log(max_alpha))
+            entroy.log_alpha.clamp_(lower, upper)
+            entroy.alpha = entroy.log_alpha.detach().exp()
+    
+        if record_history and hasattr(entroy, 'alpha_history'):
+            entroy.alpha_history.append(float(entroy.alpha.item()))
+            if len(entroy.alpha_history) > 1000:
+                entroy.alpha_history = entroy.alpha_history[-1000:]
+    
+        return entroy.alpha
 
     def _ensure_entropy_parameters(self):
         if self.auto_entropy:
@@ -1101,27 +1146,41 @@ class MASACController:
         
         # ===== Update entropy weight alpha =====
         if self.auto_entropy:
-            # Leader alpha
+    # Leader alpha
             alpha_loss_leader = -(self.entroy_leader.log_alpha * (
                 log_prob_leader.detach() + self.entroy_leader.target_entropy
             )).mean()
-            
-            if self._optimizer_step_if_finite(self.leader_alpha_optimizer, alpha_loss_leader, "alpha_loss_leader"):
-                # Update alpha value
-                self.entroy_leader.alpha = self.entroy_leader.log_alpha.detach().exp()
-            
+        
+            if self._optimizer_step_if_finite(
+                self.leader_alpha_optimizer,
+                alpha_loss_leader,
+                "alpha_loss_leader"
+            ):
+                self._clamp_entropy_alpha(self.entroy_leader, record_history=True)
+        
             # Follower alpha
             alpha_loss_followers = -(self.entroy_follower.log_alpha * (
                 log_prob_followers.detach() + self.entroy_follower.target_entropy
             )) * mask_3d
-            alpha_loss_followers = alpha_loss_followers.sum() / (mask_3d.sum() + 1e-8)
-            
-            if self._optimizer_step_if_finite(self.follower_alpha_optimizer, alpha_loss_followers, "alpha_loss_followers"):
-                # Update alpha value
-                self.entroy_follower.alpha = self.entroy_follower.log_alpha.detach().exp()
-        else:
-            self._ensure_entropy_parameters()
         
+            alpha_loss_followers = alpha_loss_followers.sum() / (mask_3d.sum() + 1e-8)
+        
+            if self._optimizer_step_if_finite(
+                self.follower_alpha_optimizer,
+                alpha_loss_followers,
+                "alpha_loss_followers"
+            ):
+                self._clamp_entropy_alpha(self.entroy_follower, record_history=True)
+        
+        else:
+            # 固定 alpha 模式：强制保持 alpha = 1
+            with torch.no_grad():
+                self.entroy_leader.log_alpha.fill_(0.0)
+                self.entroy_follower.log_alpha.fill_(0.0)
+        
+            self.entroy_leader.alpha = torch.ones_like(self.entroy_leader.log_alpha).detach()
+            self.entroy_follower.alpha = torch.ones_like(self.entroy_follower.log_alpha).detach()
+                        
         # ===== Soft update target networks =====
         # Update Critic target network
         self.critic.soft_update(self.tau)
@@ -1820,9 +1879,16 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         device=device,
         memory_capacity=MemoryCapacity,
         auto_entropy=getattr(args, "adaptive_alpha", False),
+        target_entropy=getattr(args, "target_entropy", -0.1),
+        alpha_min=getattr(args, "alpha_min", 0.01),
+        alpha_max=getattr(args, "alpha_max", 1.0),
         max_replay_ratio=20  # 允许较高的重放比例以减轻过拟合
     )
-    print(f"Alpha模式: {'自适应' if getattr(args, 'adaptive_alpha', False) else '固定为1'}")
+    print(
+    f"Alpha模式: {'自适应' if getattr(args, 'adaptive_alpha', False) else '固定为1'}, "
+    f"target_entropy={getattr(args, 'target_entropy', -0.1)}, "
+    f"alpha范围=[{getattr(args, 'alpha_min', 0.01)}, {getattr(args, 'alpha_max', 1.0)}]"
+)
     
     # 添加奖励分配验证函数
     def verify_reward_allocation(rewards, n_friendly_agents):
@@ -3944,6 +4010,12 @@ def main():
     parser.add_argument('--render', action='store_true', help='是否渲染环境')
     parser.add_argument('--adaptive_alpha', action='store_true',
                         help='开启自适应alpha；默认关闭，alpha固定为1')
+    parser.add_argument('--target_entropy', type=float, default=-0.1,
+                    help='自适应alpha的目标熵；论文设置为-0.1，二维动作常用可尝试-2.0')
+    parser.add_argument('--alpha_min', type=float, default=0.01,
+                        help='自适应alpha的下限')
+    parser.add_argument('--alpha_max', type=float, default=1.0,
+                    help='自适应alpha的上限，建议先用1.0，最多可尝试2.0')
     parser.add_argument('--test', action='store_true', help='测试模式（加载已训练的模型）')
     parser.add_argument('--model_path', type=str, default=None, 
                         help='测试模式下加载的模型文件或模型目录；不指定时会从 outputs/train/<experiment_type>/ 自动选择最新模型')
