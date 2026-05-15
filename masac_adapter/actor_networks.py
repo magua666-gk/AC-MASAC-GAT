@@ -190,9 +190,18 @@ class LeaderActorNet(nn.Module):
         # 移动到正确的设备
         device = next(self.parameters()).device
         obs_leader = obs_leader.to(device)
+
+        # 数值保护：环境状态异常时，不再把 NaN/Inf 送入策略网络
+        if not torch.isfinite(obs_leader).all():
+            print("[警告] LeaderActorNet obs_leader 出现 NaN/Inf，返回零动作")
+            return np.zeros(self.action_dim, dtype=np.float32)
         
         with torch.no_grad():
             mean, std = self.forward(obs_leader)
+
+            if (not torch.isfinite(mean).all()) or (not torch.isfinite(std).all()):
+                print("[警告] LeaderActorNet mean/std 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
             
             if evaluate:
                 # 评估模式：使用确定性策略（均值）
@@ -201,6 +210,10 @@ class LeaderActorNet(nn.Module):
                 # 训练模式：使用随机采样
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.sample()
+
+            if not torch.isfinite(action).all():
+                print("[警告] LeaderActorNet action 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
         
         # 返回 numpy 数组
         return action.cpu().numpy().squeeze()
@@ -403,9 +416,18 @@ class FollowerActorNet(nn.Module):
         # 移动到正确的设备
         device = next(self.parameters()).device
         obs_follower = obs_follower.to(device)
+
+        # 数值保护：环境状态异常时，不再把 NaN/Inf 送入策略网络
+        if not torch.isfinite(obs_follower).all():
+            print("[警告] FollowerActorNet obs_follower 出现 NaN/Inf，返回零动作")
+            return np.zeros(self.action_dim, dtype=np.float32)
         
         with torch.no_grad():
             mean, std = self.forward(obs_follower)
+
+            if (not torch.isfinite(mean).all()) or (not torch.isfinite(std).all()):
+                print("[警告] FollowerActorNet mean/std 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
             
             if evaluate:
                 # 评估模式：使用确定性策略（均值）
@@ -414,6 +436,10 @@ class FollowerActorNet(nn.Module):
                 # 训练模式：使用随机采样
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.sample()
+
+            if not torch.isfinite(action).all():
+                print("[警告] FollowerActorNet action 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
         
         # 返回 numpy 数组
         return action.cpu().numpy().squeeze()
@@ -635,9 +661,18 @@ class AttentionLeaderActorNet(nn.Module):
         obs_leader = obs_leader.to(device)
         obs_followers = obs_followers.to(device)
         mask_followers = mask_followers.to(device)
+
+        # 数值保护：环境状态异常时，不再把 NaN/Inf 送入 GAT Actor
+        if (not torch.isfinite(obs_leader).all()) or (not torch.isfinite(obs_followers).all()):
+            print("[警告] AttentionLeaderActorNet 输入观测出现 NaN/Inf，返回零动作")
+            return np.zeros(self.action_dim, dtype=np.float32)
         
         with torch.no_grad():
             mean, std = self.forward(obs_leader, obs_followers, mask_followers)
+
+            if (not torch.isfinite(mean).all()) or (not torch.isfinite(std).all()):
+                print("[警告] AttentionLeaderActorNet mean/std 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
             
             if evaluate:
                 # 评估模式：使用确定性策略（均值）
@@ -646,6 +681,10 @@ class AttentionLeaderActorNet(nn.Module):
                 # 训练模式：使用随机采样
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.sample()
+
+            if not torch.isfinite(action).all():
+                print("[警告] AttentionLeaderActorNet action 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
         
         # 返回numpy数组
         return action.cpu().numpy().squeeze()
@@ -929,6 +968,15 @@ class AttentionFollowerActorNet(nn.Module):
         obs_other_followers_for_context = obs_other_followers_for_context.to(device)
         valid_leader_for_context_mask = valid_leader_for_context_mask.to(device)
         valid_other_followers_context_mask = valid_other_followers_context_mask.to(device)
+
+        # 数值保护：环境状态异常时，不再把 NaN/Inf 送入 GAT Actor
+        if (
+            (not torch.isfinite(obs_follower_self).all())
+            or (not torch.isfinite(obs_leader_for_context).all())
+            or (not torch.isfinite(obs_other_followers_for_context).all())
+        ):
+            print("[警告] AttentionFollowerActorNet 输入观测出现 NaN/Inf，返回零动作")
+            return np.zeros(self.action_dim, dtype=np.float32)
         
         with torch.no_grad():
             mean, std = self.forward(
@@ -938,6 +986,10 @@ class AttentionFollowerActorNet(nn.Module):
                 valid_leader_for_context_mask, 
                 valid_other_followers_context_mask
             )
+
+            if (not torch.isfinite(mean).all()) or (not torch.isfinite(std).all()):
+                print("[警告] AttentionFollowerActorNet mean/std 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
             
             if evaluate:
                 # 评估模式：使用确定性策略（均值）
@@ -946,6 +998,10 @@ class AttentionFollowerActorNet(nn.Module):
                 # 训练模式：使用随机采样
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.sample()
+
+            if not torch.isfinite(action).all():
+                print("[警告] AttentionFollowerActorNet action 出现 NaN/Inf，返回零动作")
+                return np.zeros(self.action_dim, dtype=np.float32)
         
         # 返回numpy数组
         return action.cpu().numpy().squeeze() 

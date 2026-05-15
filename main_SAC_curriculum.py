@@ -55,7 +55,7 @@ class MASACController:
     def __init__(self, n_agents=1, state_dim=17, action_dim=4, memory_size=int(2e6), \
             batch_size=256, gamma=0.99, tau=0.01, value_lr=3e-4, policy_lr=1e-4, \
             hidden_dim=256, target_update_interval=2, reward_scale=0.1, \
-            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, alpha_min=0.01, alpha_max=1.0 ,device=None, 
+            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, alpha_min=0.01, alpha_max=1.0, device=None, 
             memory_capacity=None, max_replay_ratio=10.0):  # Add max_replay_ratio parameter
         """Initialize role-based MASAC controller
         
@@ -481,7 +481,14 @@ class MASACController:
         return False
 
     def _sanitize_training_tensor(self, tensor, name):
-        return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(tensor).all():
+            log(
+                f"Warning: {name} contains NaN/Inf; skipped this training step.",
+                LOG_WARNING,
+                throttle=10
+            )
+            return None
+        return tensor
 
     def _optimizer_step_if_finite(self, optimizer, loss, name):
         optimizer.zero_grad()
@@ -500,6 +507,22 @@ class MASACController:
             return False
         optimizer.step()
         return True
+    def _array_like_is_finite(self, value):
+        """检查 numpy/list/dict/tensor 中是否包含 NaN/Inf。"""
+        try:
+            if isinstance(value, dict):
+                return all(self._array_like_is_finite(v) for v in value.values())
+    
+            if isinstance(value, (list, tuple)):
+                return all(self._array_like_is_finite(v) for v in value)
+    
+            if torch.is_tensor(value):
+                return torch.isfinite(value).all().item()
+    
+            arr = np.asarray(value, dtype=np.float32)
+            return np.isfinite(arr).all()
+        except Exception:
+            return False
     
     def to(self, device):
         """Move all networks to specified device
@@ -799,6 +822,19 @@ class MASACController:
             done: Done flag
             current_stage_tag: Current curriculum stage tag for marking experience stage
         """
+        # 如果环境状态、动作或奖励中已经出现 NaN/Inf，不写入经验池
+        if not (
+            self._array_like_is_finite(states)
+            and self._array_like_is_finite(actions)
+            and self._array_like_is_finite(rewards)
+            and self._array_like_is_finite(next_states)
+        ):
+            log(
+                "store_transition: detected NaN/Inf in transition; skipped storing this sample.",
+                LOG_WARNING,
+                throttle=10
+            )
+            return
         if (isinstance(states, dict) and "leader" in states and "followers" in states and
             isinstance(actions, dict) and "leader" in actions and "followers" in actions and
             isinstance(rewards, dict) and "leader" in rewards and "followers" in rewards and
@@ -879,16 +915,44 @@ class MASACController:
         
         done = batch_data["done"]
 
-        obs_leader = self._sanitize_training_tensor(obs_leader, "obs_leader")
-        obs_followers = self._sanitize_training_tensor(obs_followers, "obs_followers")
-        next_obs_leader = self._sanitize_training_tensor(next_obs_leader, "next_obs_leader")
-        next_obs_followers = self._sanitize_training_tensor(next_obs_followers, "next_obs_followers")
-        act_leader = torch.clamp(self._sanitize_training_tensor(act_leader, "act_leader"), min_action, max_action)
-        act_followers = torch.clamp(self._sanitize_training_tensor(act_followers, "act_followers"), min_action, max_action)
-        reward_leader = self._sanitize_training_tensor(reward_leader, "reward_leader")
-        reward_followers = self._sanitize_training_tensor(reward_followers, "reward_followers")
-        done = torch.clamp(self._sanitize_training_tensor(done, "done"), 0.0, 1.0)
-        mask_followers = torch.clamp(self._sanitize_training_tensor(mask_followers, "mask_followers"), 0.0, 1.0)
+        tensors_to_check = [
+            (obs_leader, "obs_leader"),
+            (obs_followers, "obs_followers"),
+            (next_obs_leader, "next_obs_leader"),
+            (next_obs_followers, "next_obs_followers"),
+            (act_leader, "act_leader"),
+            (act_followers, "act_followers"),
+            (reward_leader, "reward_leader"),
+            (reward_followers, "reward_followers"),
+            (done, "done"),
+            (mask_followers, "mask_followers"),
+        ]
+        
+        checked_tensors = [
+            self._sanitize_training_tensor(t, name)
+            for t, name in tensors_to_check
+        ]
+        
+        if any(t is None for t in checked_tensors):
+            return
+        
+        (
+            obs_leader,
+            obs_followers,
+            next_obs_leader,
+            next_obs_followers,
+            act_leader,
+            act_followers,
+            reward_leader,
+            reward_followers,
+            done,
+            mask_followers
+        ) = checked_tensors
+        
+        act_leader = torch.clamp(act_leader, min_action, max_action)
+        act_followers = torch.clamp(act_followers, min_action, max_action)
+        done = torch.clamp(done, 0.0, 1.0)
+        mask_followers = torch.clamp(mask_followers, 0.0, 1.0)
         
         # Get number of followers (batch may have different number of followers)
         B, max_F, _ = obs_followers.shape
@@ -1146,7 +1210,7 @@ class MASACController:
         
         # ===== Update entropy weight alpha =====
         if self.auto_entropy:
-    # Leader alpha
+            # Leader alpha
             alpha_loss_leader = -(self.entroy_leader.log_alpha * (
                 log_prob_leader.detach() + self.entroy_leader.target_entropy
             )).mean()
@@ -1195,6 +1259,7 @@ class MASACController:
                 target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
             
         # Update training step count
+        self.train_step += 1
     def save_models(self, path):
         """Save model
         
@@ -1881,13 +1946,13 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         auto_entropy=getattr(args, "adaptive_alpha", False),
         target_entropy=getattr(args, "target_entropy", -0.1),
         alpha_min=getattr(args, "alpha_min", 0.01),
-        alpha_max=getattr(args, "alpha_max", 1.0),
+        alpha_max=getattr(args, "alpha_max", 3.0),
         max_replay_ratio=20  # 允许较高的重放比例以减轻过拟合
     )
     print(
     f"Alpha模式: {'自适应' if getattr(args, 'adaptive_alpha', False) else '固定为1'}, "
     f"target_entropy={getattr(args, 'target_entropy', -0.1)}, "
-    f"alpha范围=[{getattr(args, 'alpha_min', 0.01)}, {getattr(args, 'alpha_max', 1.0)}]"
+    f"alpha范围=[{getattr(args, 'alpha_min', 0.01)}, {getattr(args, 'alpha_max', 3.0)}]"
 )
     
     # 添加奖励分配验证函数
@@ -4014,7 +4079,7 @@ def main():
                     help='自适应alpha的目标熵；论文设置为-0.1，二维动作常用可尝试-2.0')
     parser.add_argument('--alpha_min', type=float, default=0.01,
                         help='自适应alpha的下限')
-    parser.add_argument('--alpha_max', type=float, default=1.0,
+    parser.add_argument('--alpha_max', type=float, default=3.0,
                     help='自适应alpha的上限，建议先用1.0，最多可尝试2.0')
     parser.add_argument('--test', action='store_true', help='测试模式（加载已训练的模型）')
     parser.add_argument('--model_path', type=str, default=None, 

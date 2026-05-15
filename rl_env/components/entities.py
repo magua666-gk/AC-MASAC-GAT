@@ -47,6 +47,40 @@ def get_dt():
     """
     return _current_dt
 
+def _safe_scalar(value, default=0.0):
+    """把标量保护成有限数，防止 NaN/Inf 进入环境动力学。"""
+    try:
+        value = float(value)
+    except Exception:
+        return float(default)
+
+    if not np.isfinite(value):
+        return float(default)
+
+    return value
+
+
+def _wrap_angle(theta):
+    """把角度限制到 [0, 2*pi)，同时处理 NaN/Inf，保持原环境角度分布不变。"""
+    theta = _safe_scalar(theta, 0.0)
+    return float(theta % (2 * math.pi))
+
+
+def _safe_action(action, action_dim=2):
+    """动作安全处理，防止 action 中的 NaN/Inf 传入速度和角度更新。"""
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+    if action.size < action_dim:
+        action = np.pad(action, (0, action_dim - action.size), mode="constant")
+    elif action.size > action_dim:
+        action = action[:action_dim]
+
+    if not np.all(np.isfinite(action)):
+        print(f"[警告] action 出现 NaN/Inf: {action}，已自动置零")
+        action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return action
+
 class Entity:
     """Base class for all entities"""
     
@@ -227,43 +261,63 @@ class Agent(Entity):
     
     def apply_action(self, action):
         """Apply action to agent
-        
+    
         Args:
             action: Action array [acceleration, angular_velocity]
         """
         if not self.alive:
             return
-            
-        a = action[0]  # Acceleration
-        phi = action[1]  # Angular velocity
-        
-        # Update speed and heading
-        self.speed = self.speed + 0.3 * a * get_dt()
-        self.theta = self.theta + 0.6 * phi * get_dt()
-        
-        # Limit speed range
-        self.speed = np.clip(self.speed, 10, 20)
     
-        # Normalize heading angle self.theta
-        if self.theta > 2 * math.pi:
-            self.theta -= 2 * math.pi
-        elif self.theta < 0:
-            self.theta += 2 * math.pi
+        action = _safe_action(action, action_dim=2)
+        dt = _safe_scalar(get_dt(), 1.0)
+    
+        a = float(action[0])
+        phi = float(action[1])
+    
+        self.speed = _safe_scalar(self.speed, 10.0)
+        self.theta = _wrap_angle(self.theta)
+    
+        # Update speed and heading
+        self.speed = self.speed + 0.3 * a * dt
+        self.theta = self.theta + 0.6 * phi * dt
+    
+        # Limit speed range
+        self.speed = float(np.clip(self.speed, 10.0, 20.0))
+    
+        # Normalize heading angle
+        self.theta = _wrap_angle(self.theta)
     
     def update(self):
         """Update agent state"""
         if not self.alive:
             return
-            
+    
+        dt = _safe_scalar(get_dt(), 1.0)
+    
+        self.speed = _safe_scalar(self.speed, 10.0)
+        self.theta = _wrap_angle(self.theta)
+        self.pos_x = _safe_scalar(self.pos_x, Constants.AREA_X)
+        self.pos_y = _safe_scalar(self.pos_y, Constants.AREA_Y)
+    
+        # 防止速度异常
+        self.speed = float(np.clip(self.speed, 0.0, 40.0))
+    
         # Update position based on speed and heading
-        dt = get_dt()  # Get current dt value
-        self.pos_x = self.pos_x + self.speed * np.cos(self.theta) * dt
-        self.pos_y = self.pos_y + self.speed * np.sin(self.theta) * dt
-        
+        new_x = self.pos_x + self.speed * np.cos(self.theta) * dt
+        new_y = self.pos_y + self.speed * np.sin(self.theta) * dt
+    
+        if not np.isfinite(new_x):
+            print("[警告] new_x 出现 NaN/Inf，已保持上一时刻 x")
+            new_x = self.pos_x
+    
+        if not np.isfinite(new_y):
+            print("[警告] new_y 出现 NaN/Inf，已保持上一时刻 y")
+            new_y = self.pos_y
+    
         # Keep within boundaries
-        self.pos_x = np.clip(self.pos_x, Constants.AREA_X, Constants.AREA_WITH)
-        self.pos_y = np.clip(self.pos_y, Constants.AREA_Y, Constants.AREA_HEIGHT)
-        
+        self.pos_x = float(np.clip(new_x, Constants.AREA_X, Constants.AREA_WITH))
+        self.pos_y = float(np.clip(new_y, Constants.AREA_Y, Constants.AREA_HEIGHT))
+    
         # Update rect position
         self.rect.center = (self.pos_x, self.pos_y)
     
@@ -383,29 +437,29 @@ class LeaderAgent(Agent):
 
     def apply_action(self, action):
         """Apply action to leader
-        
+    
         Args:
             action: Action array [acceleration, angular_velocity]
         """
         if not self.alive:
             return
-            
-        dt = get_dt()
-        a = action[0]  # Acceleration component
-        phi = action[1]  # Angular velocity component
-        
+    
+        action = _safe_action(action, action_dim=2)
+        dt = _safe_scalar(get_dt(), 1.0)
+    
+        a = float(action[0])
+        phi = float(action[1])
+    
+        self.speed = _safe_scalar(self.speed, 15.0)
+        self.theta = _wrap_angle(self.theta)
+    
         # Leader-specific speed update
         self.speed = self.speed + 0.3 * a * dt
-        self.speed = np.clip(self.speed, 10, 20) # Leader speed clipping range [10, 20]
-        
+        self.speed = float(np.clip(self.speed, 10.0, 20.0))
+    
         # Leader-specific heading update
         self.theta = self.theta + 0.6 * phi * dt
-        
-        # Normalize heading angle self.theta
-        if self.theta > 2 * math.pi:
-            self.theta -= 2 * math.pi
-        elif self.theta < 0:
-            self.theta += 2 * math.pi
+        self.theta = _wrap_angle(self.theta)
 
 
 class FollowerAgent(Agent):
@@ -427,29 +481,29 @@ class FollowerAgent(Agent):
     
     def apply_action(self, action):
         """Apply action to follower
-        
+    
         Args:
             action: Action array [acceleration, angular_velocity]
         """
         if not self.alive:
             return
-            
-        dt = get_dt()
-        a = action[0]  # Acceleration component
-        phi = action[1]  # Angular velocity component
-        
+    
+        action = _safe_action(action, action_dim=2)
+        dt = _safe_scalar(get_dt(), 1.0)
+    
+        a = float(action[0])
+        phi = float(action[1])
+    
+        self.speed = _safe_scalar(self.speed, 25.0)
+        self.theta = _wrap_angle(self.theta)
+    
         # Follower-specific speed update
         self.speed = self.speed + 0.6 * a * dt
-        self.speed = np.clip(self.speed, 10, 40) # Follower speed clipping range
-        
+        self.speed = float(np.clip(self.speed, 10.0, 40.0))
+    
         # Follower-specific heading update
         self.theta = self.theta + 1.2 * phi * dt
-        
-        # Normalize heading angle self.theta
-        if self.theta > 2 * math.pi:
-            self.theta -= 2 * math.pi
-        elif self.theta < 0:
-            self.theta += 2 * math.pi
+        self.theta = _wrap_angle(self.theta)
 
 
 class Obstacle(Entity):
