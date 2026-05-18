@@ -1561,7 +1561,7 @@ def print_task_details(task, title="任务详情"):
     log("=" * (len(title) + 10), LOG_INFO)
     log("", LOG_INFO)
 
-def run_with_curriculum(args, initial_n_agent, initial_m_enemy):
+def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42):
     """使用课程学习训练MASAC
     
     Args:
@@ -1569,6 +1569,8 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy):
         initial_n_agent: 初始友方数量
         initial_m_enemy: 初始敌方数量
     """
+    set_seed(seed)
+    print(f"设置随机种子: {seed}")
     # 确保结果目录存在
     global RESULTS_DIR, TEST_RESULTS_BASE, TRAINING_RESULTS_FILE
     ensure_dir_exists(RESULTS_DIR)
@@ -2427,7 +2429,7 @@ def analyze_curriculum_learning(manager: CurriculumManager):
     
     print("\n课程学习分析完成")
 
-def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, collect_formation_data=True):
+def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, collect_formation_data=True, seed=None):
     """运行蒙特卡洛测试以评估模型性能
     
     Args:
@@ -2441,6 +2443,10 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     """
     import numpy as np  # 移到函数开始处避免UnboundLocalError
     global RENDER, N_Agent, M_Enemy, action_number
+
+    if seed is not None:
+        set_seed(seed)
+        print(f"设置测试随机种子: {seed}")
     
     if test_episodes is None:
         test_episodes = TEST_EPIOSDE
@@ -2507,6 +2513,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         'test_info': {
             'test_id': get_timestamp(),
             'timestamp': time.time(),
+            'seed': seed,
             'total_episodes': test_episodes,
             'agents_config': {
                 'leader_count': N_Agent,
@@ -2801,7 +2808,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "hero_count": N_Agent,
             "enemy_count": M_Enemy,
             "obstacle_count": obstacle_count,
-            "uav_speed": uav_speed
+            "uav_speed": uav_speed,
+            "seed": seed
         },
         "timestamp": time.time()
     }
@@ -2840,6 +2848,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     test_info = {
         "timestamp": timestamp,
         "date": date_str,
+        "seed": seed,
         "model": model_name,
         "config": results["test_config"],
         "success_rate": success_rate,
@@ -3154,7 +3163,7 @@ def analyze_test_results(result_files=None, base_path=None):
     
     return test_results
 
-def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficulty_levels=None):
+def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficulty_levels=None, seed=None):
     """执行蒙特卡洛测试
     
     Args:
@@ -3188,6 +3197,7 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         "timestamp": timestamp,
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": model_name,
+        "seed": seed,
         "test_episodes": test_nums,
         "difficulty_levels": base_difficulty_levels,
         "hero_count": N_Agent,
@@ -3213,7 +3223,8 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         result = run_monte_carlo_test(
             model_path=actor_path,
             test_episodes=test_nums,
-            test_options=difficulty_config
+            test_options=difficulty_config,
+            seed=seed
         )
         
         # 存储结果
@@ -3386,8 +3397,12 @@ def main():
     # 添加日志级别控制
     parser.add_argument('--log_level', type=str, choices=['debug', 'info', 'warning', 'error'], default='info',
                       help='设置日志级别：debug(调试), info(信息), warning(警告), error(错误)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='训练或测试使用的随机种子，默认为42')
                        
     args = parser.parse_args()
+    set_seed(args.seed)
+    print(f"设置随机种子: {args.seed}")
     
     # 设置全局日志级别
     log_level_map = {
@@ -3490,7 +3505,8 @@ def main():
             actor_path=args.model_path,
             critic_path=args.model_path,  # 使用相同的路径前缀，加载函数会自动添加_critic_{i}.pth
             test_nums=args.test_episodes or TEST_EPIOSDE,
-            base_difficulty_levels=difficulty_levels
+            base_difficulty_levels=difficulty_levels,
+            seed=args.seed
         )
     elif args.test:
         # 单难度测试模式
@@ -3510,14 +3526,15 @@ def main():
         run_monte_carlo_test(
             model_path=args.model_path,
             test_episodes=args.test_episodes or TEST_EPIOSDE, # TEST_EPIOSDE 也需要定义
-            test_options=test_options
+            test_options=test_options,
+            seed=args.seed
         )
     else:
         # 训练模式
         if args.use_curriculum:
             print("使用课程学习框架进行训练")
             # 传递 n_agent 和 m_enemy 给 run_with_curriculum
-            run_with_curriculum(args, n_agent, m_enemy)
+            run_with_curriculum(args, n_agent, m_enemy, seed=args.seed)
         else:
             print("使用标准MASAC进行训练")
             import main_SAC

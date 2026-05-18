@@ -2678,7 +2678,7 @@ def run_multi_seed_training(args, n_agent, m_enemy):
 
 
 
-def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, collect_formation_data=True):
+def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, collect_formation_data=True, seed=None):
     """运行蒙特卡洛测试以评估模型性能
     
     Args:
@@ -2692,6 +2692,10 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     """
     import numpy as np  # 移到函数开始处避免UnboundLocalError
     global RENDER, N_Agent, M_Enemy, action_number, TEST_EPIOSDE, state_number, device
+
+    if seed is not None:
+        set_seed(seed)
+        print(f"设置测试随机种子: {seed}")
     
     if test_episodes is None:
         test_episodes = TEST_EPIOSDE
@@ -2761,6 +2765,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         'test_info': {
             'test_id': get_timestamp(),
             'timestamp': time.time(),
+            'seed': seed,
             'total_episodes': test_episodes,
             'agents_config': {
                 'leader_count': N_Agent,
@@ -3029,7 +3034,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "hero_count": n_agent,
             "enemy_count": m_enemy,
             "obstacle_count": obstacle_count,
-            "uav_speed": uav_speed
+            "uav_speed": uav_speed,
+            "seed": seed
         },
         "five_metrics": five_metrics,  # 添加五项性能指标
         "timestamp": time.time()
@@ -3069,6 +3075,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     test_info = {
         "timestamp": timestamp,
         "date": date_str,
+        "seed": seed,
         "model": model_name,
         "config": results["test_config"],
         "success_rate": success_rate,
@@ -3383,7 +3390,7 @@ def analyze_test_results(result_files=None, base_path=None):
     
     return test_results
 
-def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficulty_levels=None):
+def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficulty_levels=None, seed=None):
     """执行蒙特卡洛测试
     
     Args:
@@ -3419,6 +3426,7 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         "timestamp": timestamp,
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": model_name,
+        "seed": seed,
         "test_episodes": test_nums,
         "difficulty_levels": base_difficulty_levels,
         "hero_count": N_Agent,
@@ -3444,7 +3452,8 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         result = run_monte_carlo_test(
             model_path=actor_path,
             test_episodes=test_nums,
-            test_options=difficulty_config
+            test_options=difficulty_config,
+            seed=seed
         )
         
         # 存储结果
@@ -3633,8 +3642,12 @@ def main():
                        help='多次训练模式下的训练次数，默认为3次')
     parser.add_argument('--seeds', type=str, default=None,
                        help='自定义随机种子列表，格式为逗号分隔的数字，例如"42,123,456"。如不指定则自动生成')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='单次训练或测试使用的随机种子，默认为42')
                        
     args = parser.parse_args()
+    set_seed(args.seed)
+    print(f"设置随机种子: {args.seed}")
     
     # 设置全局日志级别
     log_level_map = {
@@ -3749,7 +3762,8 @@ def main():
             actor_path=model_path,
             critic_path=model_path,  # 使用相同的路径前缀，加载函数会自动添加_critic_{i}.pth
             test_nums=args.test_episodes or TEST_EPIOSDE,
-            base_difficulty_levels=difficulty_levels
+            base_difficulty_levels=difficulty_levels,
+            seed=args.seed
         )
     elif args.test:
         # 单难度测试模式
@@ -3777,7 +3791,8 @@ def main():
         run_monte_carlo_test(
             model_path=model_path,
             test_episodes=args.test_episodes or TEST_EPIOSDE, # TEST_EPIOSDE 也需要定义
-            test_options=test_options
+            test_options=test_options,
+            seed=args.seed
         )
     else:
         # 训练模式 - 直接训练（无课程学习）
@@ -3787,7 +3802,7 @@ def main():
         else:
             print("使用单次直接训练模式（无课程学习）")
             # 使用 n_agent 和 m_enemy 变量进行直接训练
-            run_direct_training(args, n_agent, m_enemy)
+            run_direct_training(args, n_agent, m_enemy, seed=args.seed)
 
 if __name__ == "__main__":
     # 定义一些全局常量（如果测试模式需要）
