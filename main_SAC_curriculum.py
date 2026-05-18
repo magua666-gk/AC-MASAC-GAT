@@ -411,7 +411,7 @@ class MASACController:
         # 1）如果开启自适应 alpha，则按 alpha_min / alpha_max 裁剪
         # 2）如果没有开启自适应 alpha，则强制 alpha = 1
         if self.auto_entropy:
-            self._clamp_entropy_alpha(entroy, record_history=False)
+            entroy.alpha = entroy.log_alpha.exp()
         else:
             with torch.no_grad():
                 entroy.log_alpha.fill_(0.0)
@@ -1214,27 +1214,26 @@ class MASACController:
             alpha_loss_leader = -(self.entroy_leader.log_alpha * (
                 log_prob_leader.detach() + self.entroy_leader.target_entropy
             )).mean()
-        
-            if self._optimizer_step_if_finite(
-                self.leader_alpha_optimizer,
-                alpha_loss_leader,
-                "alpha_loss_leader"
-            ):
-                self._clamp_entropy_alpha(self.entroy_leader, record_history=True)
-        
+
+            self.leader_alpha_optimizer.zero_grad()
+            alpha_loss_leader.backward()
+            self.leader_alpha_optimizer.step()
+
+            # Update alpha value
+            self.entroy_leader.alpha = self.entroy_leader.log_alpha.exp()
+
             # Follower alpha
             alpha_loss_followers = -(self.entroy_follower.log_alpha * (
                 log_prob_followers.detach() + self.entroy_follower.target_entropy
             )) * mask_3d
-        
             alpha_loss_followers = alpha_loss_followers.sum() / (mask_3d.sum() + 1e-8)
-        
-            if self._optimizer_step_if_finite(
-                self.follower_alpha_optimizer,
-                alpha_loss_followers,
-                "alpha_loss_followers"
-            ):
-                self._clamp_entropy_alpha(self.entroy_follower, record_history=True)
+
+            self.follower_alpha_optimizer.zero_grad()
+            alpha_loss_followers.backward()
+            self.follower_alpha_optimizer.step()
+
+            # Update alpha value
+            self.entroy_follower.alpha = self.entroy_follower.log_alpha.exp()
         
         else:
             # 固定 alpha 模式：强制保持 alpha = 1
@@ -1807,6 +1806,26 @@ def print_task_details(task, title="任务详情"):
     log("=" * (len(title) + 10), LOG_INFO)
     log("", LOG_INFO)
 
+
+def is_current_step_in_formation(env, distance_threshold=50.0):
+    """Return True only when all current followers are within formation range."""
+    entity_manager = getattr(env, "entity_manager", None)
+    if entity_manager is None or not entity_manager.leaders or not entity_manager.followers:
+        return False
+
+    leader = entity_manager.leaders[0]
+    if hasattr(leader, "is_alive") and not leader.is_alive():
+        return False
+
+    for follower in entity_manager.followers:
+        if hasattr(follower, "is_alive") and not follower.is_alive():
+            return False
+        if follower.distance_to(leader) >= distance_threshold:
+            return False
+
+    return True
+
+
 def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=None):
     """使用课程学习训练MASAC
     
@@ -2195,7 +2214,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
                 step_count += 1
                 
                 # 计算编队时间
-                if team_counter > 0:
+                if is_current_step_in_formation(env):
                     team_formation_time += 1
                 
                 # 如果缓冲区足够大，开始学习
@@ -2921,7 +2940,11 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     rewards = []
     steps = []
     formation_rates = []
-    distances = []  # 智能体最终与目标的距离
+    distance_metrics = {
+        "leader_to_goal": [],
+        "leader_to_follower": [],
+        "leader_to_obstacle": [],
+    }
     trajectory_lengths = []  # 飞行轨迹长度列表
     energy_consumptions = []  # 能量消耗列表
     
@@ -3026,7 +3049,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             step_count += 1
             
             # 计算编队时间
-            if team_counter > 0:
+            if is_current_step_in_formation(env):
                 team_formation_time += 1
             
             # 渲染环境
@@ -3069,17 +3092,19 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         # 记录最终距离
         if last_distance is not None:
             if isinstance(last_distance, dict):
-                # 如果是字典，取所有值的最小值
-                if last_distance:
-                    distances.append(min(last_distance.values()))
-                else:
-                    distances.append(0)  # 如果字典为空，使用0
-            elif isinstance(last_distance, (list, tuple, np.ndarray)):
-                # 如果是列表、元组或数组，取最小值
-                distances.append(min(last_distance))
-            else:
-                # 如果是标量，直接添加
-                distances.append(last_distance)
+                if "leader_to_goal" in last_distance:
+                    distance_metrics["leader_to_goal"].append(float(last_distance["leader_to_goal"]))
+
+                follower_distances = [
+                    float(value)
+                    for key, value in last_distance.items()
+                    if key.startswith("leader_to_follower_")
+                ]
+                if follower_distances:
+                    distance_metrics["leader_to_follower"].append(float(np.mean(follower_distances)))
+
+                if "leader_to_obstacle" in last_distance:
+                    distance_metrics["leader_to_obstacle"].append(float(last_distance["leader_to_obstacle"]))
         
         # 存储轨迹长度和能量消耗
         trajectory_lengths.append(episode_trajectory_length)
@@ -3138,8 +3163,14 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     std_formation_rate = np.std(formation_rates)
     
     # 计算最终距离的平均值和标准差
-    avg_distance = np.mean(distances) if distances else 0
-    std_distance = np.std(distances) if distances else 0
+    distance_stats = {
+        metric_name: {
+            "mean": float(np.mean(values)) if values else 0.0,
+            "std": float(np.std(values)) if values else 0.0,
+            "values": [float(value) for value in values]
+        }
+        for metric_name, values in distance_metrics.items()
+    }
     
     # 计算新增指标
     avg_trajectory_length = np.mean(trajectory_lengths) if trajectory_lengths else 0
@@ -3159,7 +3190,12 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     print(f"4. 飞行轨迹(J_S): {avg_trajectory_length:.2f}±{std_trajectory_length:.2f}")
     print(f"5. 能量消耗(J_C): {avg_energy_consumption:.2f}±{std_energy_consumption:.2f}")
     print(f"平均奖励: {avg_reward:.2f}±{std_reward:.2f}")
-    print(f"平均最终距离: {avg_distance:.2f}±{std_distance:.2f}")
+    print(
+        "平均最终距离: "
+        f"leader_to_goal={distance_stats['leader_to_goal']['mean']:.2f}±{distance_stats['leader_to_goal']['std']:.2f}, "
+        f"leader_to_follower={distance_stats['leader_to_follower']['mean']:.2f}±{distance_stats['leader_to_follower']['std']:.2f}, "
+        f"leader_to_obstacle={distance_stats['leader_to_obstacle']['mean']:.2f}±{distance_stats['leader_to_obstacle']['std']:.2f}"
+    )
     
     # 构建结果字典
     results = {
@@ -3185,11 +3221,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "std": float(std_formation_rate),
             "values": [float(f) for f in formation_rates]
         },
-        "distances": {
-            "mean": float(avg_distance),
-            "std": float(std_distance),
-            "values": [float(d) for d in distances]
-        },
+        "distances": distance_stats,
         "trajectory_lengths": {
             "mean": float(avg_trajectory_length),
             "std": float(std_trajectory_length),
@@ -3276,9 +3308,12 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                 "mean": float(avg_steps),
                 "std": float(std_steps)
             },
-            "avg_distance": {
-                "mean": float(avg_distance),
-                "std": float(std_distance)
+            "distance_metrics": {
+                metric_name: {
+                    "mean": metric_stats["mean"],
+                    "std": metric_stats["std"]
+                }
+                for metric_name, metric_stats in distance_stats.items()
             }
         }
     }
@@ -3358,13 +3393,22 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         plt.legend()
         
         # 距离分布直方图
-        if distances:
+        if any(metric_stats["values"] for metric_stats in distance_stats.values()):
             plt.subplot(2, 2, 4)
-            plt.hist(distances, bins=min(20, test_episodes//5), alpha=0.7)
+            for metric_name, metric_stats in distance_stats.items():
+                values = metric_stats["values"]
+                if not values:
+                    continue
+                plt.hist(values, bins=min(20, test_episodes//5), alpha=0.45, label=metric_name)
+                plt.axvline(
+                    metric_stats["mean"],
+                    linestyle='dashed',
+                    linewidth=1,
+                    label=f'{metric_name} mean: {metric_stats["mean"]:.2f}'
+                )
             plt.title('最终距离分布')
             plt.xlabel('距离')
             plt.ylabel('频次')
-            plt.axvline(avg_distance, color='r', linestyle='dashed', linewidth=1, label=f'平均值: {avg_distance:.2f}')
             plt.legend()
         
         plt.tight_layout()
@@ -4073,6 +4117,7 @@ def main():
     parser = argparse.ArgumentParser(description='MASAC with Curriculum Learning', parents=[pre_parser])
     parser.add_argument('--use_curriculum', action='store_true', help='使用课程学习框架')
     parser.add_argument('--render', action='store_true', help='是否渲染环境')
+    parser.add_argument('--no_render', action='store_true', help='测试模式下关闭渲染窗口')
     parser.add_argument('--adaptive_alpha', action='store_true',
                         help='开启自适应alpha；默认关闭，alpha固定为1')
     parser.add_argument('--target_entropy', type=float, default=-0.1,
@@ -4172,7 +4217,9 @@ def main():
         return
     
     # 设置渲染标志：测试时默认渲染，训练时固定关闭渲染
-    if args.test or args.multi_difficulty_test:
+    if args.no_render:
+        RENDER = False
+    elif args.test or args.multi_difficulty_test:
         RENDER = True
     else:
         RENDER = False

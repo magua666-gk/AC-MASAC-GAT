@@ -38,19 +38,19 @@ python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_
 
 # Main experiment single-difficulty test.
 # If --model_path is omitted, the latest model under outputs/train/curriculum/ is selected automatically.
-python main_SAC_curriculum.py --experiment_type curriculum --test
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render
 
 # Main experiment multi-difficulty test
-python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test
+python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test --no_render
 
 # Main experiment test with an explicit timestamped model file
-python main_SAC_curriculum.py --experiment_type curriculum --test --model_path outputs/train/curriculum/<run_dir>/model/final/final_model_<timestamp>
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --model_path outputs/train/curriculum/<run_dir>/model/final/final_model_<timestamp>
 
 # no_attention test
-python main_SAC_curriculum.py --experiment_type no_attention --test --model_path outputs/train/no_attention/<run_dir>/model/final/final_model_<timestamp>
+python main_SAC_curriculum.py --experiment_type no_attention --test --no_render --model_path outputs/train/no_attention/<run_dir>/model/final/final_model_<timestamp>
 
 # no_curriculum test
-python main_SAC_curriculum.py --experiment_type no_curriculum --test --model_path outputs/train/no_curriculum/<run_dir>/model/final/final_model_<timestamp>
+python main_SAC_curriculum.py --experiment_type no_curriculum --test --no_render --model_path outputs/train/no_curriculum/<run_dir>/model/final/final_model_<timestamp>
 
 # 固定 alpha=1，对照组
 python main_SAC_curriculum.py --use_curriculum

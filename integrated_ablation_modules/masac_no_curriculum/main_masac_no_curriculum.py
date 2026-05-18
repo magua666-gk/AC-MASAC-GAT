@@ -1891,11 +1891,22 @@ def run_direct_training(args, n_agent, m_enemy, seed=42, run_id=None):
         distance_str = "N/A"
         if last_distance is not None:
             if isinstance(last_distance, dict):
-                # 如果是字典，取所有值的最小值
-                if last_distance:
-                    distance_str = f"{min(last_distance.values()):.2f}"
-                else:
-                    distance_str = "0.00"
+                distance_parts = []
+                if "leader_to_goal" in last_distance:
+                    distance_parts.append(f"goal={float(last_distance['leader_to_goal']):.2f}")
+
+                follower_distances = [
+                    float(value)
+                    for key, value in last_distance.items()
+                    if key.startswith("leader_to_follower_")
+                ]
+                if follower_distances:
+                    distance_parts.append(f"follower={float(np.mean(follower_distances)):.2f}")
+
+                if "leader_to_obstacle" in last_distance:
+                    distance_parts.append(f"obstacle={float(last_distance['leader_to_obstacle']):.2f}")
+
+                distance_str = ", ".join(distance_parts) if distance_parts else "N/A"
             elif isinstance(last_distance, (list, tuple, np.ndarray)):
                 # 如果是列表、元组或数组，取最小值
                 distance_str = f"{min(last_distance):.2f}"
@@ -2736,7 +2747,11 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     rewards = []
     steps = []
     formation_rates = []
-    distances = []  # 智能体最终与目标的距离
+    distance_metrics = {
+        "leader_to_goal": [],
+        "leader_to_follower": [],
+        "leader_to_obstacle": [],
+    }
     
     # 初始化五项指标所需的数据收集列表
     episode_data_list = []
@@ -2877,17 +2892,19 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         # 记录最终距离
         if last_distance is not None:
             if isinstance(last_distance, dict):
-                # 如果是字典，取所有值的最小值
-                if last_distance:
-                    distances.append(min(last_distance.values()))
-                else:
-                    distances.append(0)  # 如果字典为空，使用0
-            elif isinstance(last_distance, (list, tuple, np.ndarray)):
-                # 如果是列表、元组或数组，取最小值
-                distances.append(min(last_distance))
-            else:
-                # 如果是标量，直接添加
-                distances.append(last_distance)
+                if "leader_to_goal" in last_distance:
+                    distance_metrics["leader_to_goal"].append(float(last_distance["leader_to_goal"]))
+
+                follower_distances = [
+                    float(value)
+                    for key, value in last_distance.items()
+                    if key.startswith("leader_to_follower_")
+                ]
+                if follower_distances:
+                    distance_metrics["leader_to_follower"].append(float(np.mean(follower_distances)))
+
+                if "leader_to_obstacle" in last_distance:
+                    distance_metrics["leader_to_obstacle"].append(float(last_distance["leader_to_obstacle"]))
         
         # 收集当前回合的五项指标数据
         episode_data = {
@@ -2954,8 +2971,14 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     std_formation_rate = np.std(formation_rates)
     
     # 计算最终距离的平均值和标准差
-    avg_distance = np.mean(distances) if distances else 0
-    std_distance = np.std(distances) if distances else 0
+    distance_stats = {
+        metric_name: {
+            "mean": float(np.mean(values)) if values else 0.0,
+            "std": float(np.std(values)) if values else 0.0,
+            "values": [float(value) for value in values]
+        }
+        for metric_name, values in distance_metrics.items()
+    }
     
     # 计算五项性能指标
     five_metrics = calculate_five_performance_metrics(episode_data_list)
@@ -2967,7 +2990,12 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     print(f"平均奖励: {avg_reward:.2f}±{std_reward:.2f}")
     print(f"平均步数: {avg_steps:.2f}±{std_steps:.2f}")
     print(f"平均编队保持率: {avg_formation_rate:.2f}±{std_formation_rate:.2f}")
-    print(f"平均最终距离: {avg_distance:.2f}±{std_distance:.2f}")
+    print(
+        "平均最终距离: "
+        f"leader_to_goal={distance_stats['leader_to_goal']['mean']:.2f}±{distance_stats['leader_to_goal']['std']:.2f}, "
+        f"leader_to_follower={distance_stats['leader_to_follower']['mean']:.2f}±{distance_stats['leader_to_follower']['std']:.2f}, "
+        f"leader_to_obstacle={distance_stats['leader_to_obstacle']['mean']:.2f}±{distance_stats['leader_to_obstacle']['std']:.2f}"
+    )
     
     # 输出五项性能评估指标
     print("\n五指标性能评估:")
@@ -2996,11 +3024,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "std": float(std_formation_rate),
             "values": [float(f) for f in formation_rates]
         },
-        "distances": {
-            "mean": float(avg_distance),
-            "std": float(std_distance),
-            "values": [float(d) for d in distances]
-        },
+        "distances": distance_stats,
         "test_config": {
             "hero_count": n_agent,
             "enemy_count": m_enemy,
@@ -3050,7 +3074,14 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         "success_rate": success_rate,
         "avg_reward": float(avg_reward),
         "avg_steps": float(avg_steps),
-        "formation_rate": float(avg_formation_rate)
+        "formation_rate": float(avg_formation_rate),
+        "distance_metrics": {
+            metric_name: {
+                "mean": metric_stats["mean"],
+                "std": metric_stats["std"]
+            }
+            for metric_name, metric_stats in distance_stats.items()
+        }
     }
     
     info_path = os.path.join(test_dir, "test_info.json")
@@ -3109,13 +3140,22 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         plt.legend()
         
         # 距离分布直方图
-        if distances:
+        if any(metric_stats["values"] for metric_stats in distance_stats.values()):
             plt.subplot(2, 2, 4)
-            plt.hist(distances, bins=min(20, test_episodes//5), alpha=0.7)
+            for metric_name, metric_stats in distance_stats.items():
+                values = metric_stats["values"]
+                if not values:
+                    continue
+                plt.hist(values, bins=min(20, test_episodes//5), alpha=0.45, label=metric_name)
+                plt.axvline(
+                    metric_stats["mean"],
+                    linestyle='dashed',
+                    linewidth=1,
+                    label=f'{metric_name} mean: {metric_stats["mean"]:.2f}'
+                )
             plt.title('最终距离分布')
             plt.xlabel('距离')
             plt.ylabel('频次')
-            plt.axvline(avg_distance, color='r', linestyle='dashed', linewidth=1, label=f'平均值: {avg_distance:.2f}')
             plt.legend()
         
         plt.tight_layout()
@@ -3549,6 +3589,7 @@ def main():
     # 添加命令行参数解析
     parser = argparse.ArgumentParser(description='MASAC without Curriculum Learning')
     parser.add_argument('--render', action='store_true', help='是否渲染环境')
+    parser.add_argument('--no_render', action='store_true', help='测试模式下关闭渲染窗口')
     parser.add_argument('--test', action='store_true', help='测试模式（加载已训练的模型）')
     parser.add_argument('--model_path', type=str, default='models/direct_training_final/final_model', 
                         help='测试模式下加载的模型路径')
@@ -3633,7 +3674,9 @@ def main():
         return
     
     # 设置渲染标志：测试时默认渲染，训练时根据参数决定
-    if args.test or args.multi_difficulty_test:
+    if args.no_render:
+        RENDER = False
+    elif args.test or args.multi_difficulty_test:
         RENDER = True
     else:
         RENDER = args.render
