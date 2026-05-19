@@ -374,13 +374,25 @@ class MASACController:
         
         if num_followers > len(self.follower_actors):
             log(f"Warning: Requested follower count ({num_followers}) exceeds pre-allocated follower actor networks ({len(self.follower_actors)})", LOG_WARNING)
-            log(f"Will use {len(self.follower_actors)} follower actor networks to handle up to {len(self.follower_actors)} followers", LOG_WARNING)
-            log(f"Consider reinitializing MASACController with larger pre-allocated follower network count", LOG_WARNING)
+            log("Extra followers will reuse existing follower actors in round-robin order", LOG_WARNING)
         
         self._reset_noise()
         self.memory_n_agents_version = n_agents
             
-        print(f"Successfully adjusted to {n_agents} agents (1 Leader + {min(num_followers, len(self.follower_actors))} available Followers)")
+        print(f"Successfully adjusted to {n_agents} agents (1 Leader + {num_followers} Followers, {len(self.follower_actors)} follower actor networks)")
+
+    def _follower_actor_for_index(self, follower_idx, target=False):
+        """Return the follower actor for an environment follower index.
+
+        If there are more environment followers than actor networks, actors are
+        reused in round-robin order: 0, 1, 2, 0, 1, 2, ...
+        """
+        actors = self.target_follower_actors if target else self.follower_actors
+        actor_count = len(actors)
+        if actor_count == 0:
+            raise IndexError("No follower actor networks are available")
+        actor_idx = follower_idx % actor_count
+        return actors[actor_idx], actor_idx
 
     def _entropy_tensor(self, value):
         if isinstance(value, torch.Tensor):
@@ -625,7 +637,8 @@ class MASACController:
                 
                 try:
                     # If AttentionFollowerActorNet, need to provide context information
-                    if isinstance(self.follower_actors[i], AttentionFollowerActorNet):
+                    follower_actor, _ = self._follower_actor_for_index(i)
+                    if isinstance(follower_actor, AttentionFollowerActorNet):
                         # Prepare Leader context observations
                         leader_obs_for_context = leader_obs.reshape(1, -1)  # [1, state_dim]
                         leader_mask = np.ones((1, 1), dtype=bool)
@@ -640,7 +653,7 @@ class MASACController:
                             other_followers_obs = np.zeros((1, 0, self.state_dim), dtype=np.float32)
                             other_followers_mask = np.zeros((1, 0), dtype=bool)
                         
-                        follower_action = self.follower_actors[i].choose_action(
+                        follower_action = follower_actor.choose_action(
                             follower_obs,
                             leader_obs_for_context,
                             other_followers_obs,
@@ -649,7 +662,7 @@ class MASACController:
                             evaluate=evaluate
                         )
                     else:
-                        follower_action = self.follower_actors[i].choose_action(follower_obs, evaluate=evaluate)
+                        follower_action = follower_actor.choose_action(follower_obs, evaluate=evaluate)
                 except Exception as e:
                     log(f"Error selecting Follower {i} action: {e}", LOG_ERROR)
                     follower_action = np.zeros(self.action_dim)
@@ -762,7 +775,8 @@ class MASACController:
                 
                 try:
                     # If AttentionFollowerActorNet, need to provide context information
-                    if isinstance(self.follower_actors[follower_idx], AttentionFollowerActorNet):
+                    follower_actor, _ = self._follower_actor_for_index(follower_idx)
+                    if isinstance(follower_actor, AttentionFollowerActorNet):
                         # Prepare Leader context observation
                         leader_obs_for_context = leader_state.reshape(1, -1)  # [1, state_dim]
                         leader_mask = np.ones((1, 1), dtype=bool)  # [1, 1]
@@ -779,7 +793,7 @@ class MASACController:
                             other_followers_mask = np.zeros((1, 0), dtype=bool)
                         
                         # Call follower Actor network
-                        follower_action = self.follower_actors[follower_idx].choose_action(
+                        follower_action = follower_actor.choose_action(
                             states_list[i],
                             leader_obs_for_context,
                             other_followers_obs,
@@ -789,7 +803,7 @@ class MASACController:
                         )
                     else:
                         # Compatible with old FollowerActorNet
-                        follower_action = self.follower_actors[follower_idx].choose_action(states_list[i], evaluate=evaluate)
+                        follower_action = follower_actor.choose_action(states_list[i], evaluate=evaluate)
                     
                     # Add exploration noise
                     if add_noise and not evaluate:
@@ -956,7 +970,7 @@ class MASACController:
         
         # Get number of followers (batch may have different number of followers)
         B, max_F, _ = obs_followers.shape
-        num_active_followers = min(max_F, len(self.follower_actors))
+        num_active_followers = max_F if len(self.follower_actors) > 0 else 0
         
         # ===== Calculate Critic loss =====
         # 1. Calculate target Q value
@@ -990,9 +1004,10 @@ class MASACController:
                     other_followers_context_k = torch.zeros(B, 0, self.state_dim, device=self.device)
                     valid_other_followers_mask_k = torch.zeros(B, 0, dtype=torch.bool, device=self.device)
                 
-                if isinstance(self.target_follower_actors[k], AttentionFollowerActorNet):
+                target_follower_actor, _ = self._follower_actor_for_index(k, target=True)
+                if isinstance(target_follower_actor, AttentionFollowerActorNet):
                     # Use attention-based Follower Actor network
-                    act_k, log_prob_k = self.target_follower_actors[k].evaluate(
+                    act_k, log_prob_k = target_follower_actor.evaluate(
                         follower_self_obs_k,
                         leader_for_context_k,
                         other_followers_context_k,
@@ -1001,7 +1016,7 @@ class MASACController:
                     )
                 else:
                     # Use legacy Follower Actor network
-                    act_k, log_prob_k = self.target_follower_actors[k].evaluate(follower_self_obs_k)
+                    act_k, log_prob_k = target_follower_actor.evaluate(follower_self_obs_k)
                 
                 next_act_followers_list.append(act_k.unsqueeze(1))  # Add follower dimension [B, 1, action_dim]
                 next_log_prob_followers_list.append(log_prob_k.unsqueeze(1))  # [B, 1, 1]
@@ -1142,9 +1157,10 @@ class MASACController:
                 other_followers_context_k = torch.zeros(B, 0, self.state_dim, device=self.device)
                 valid_other_followers_mask_k = torch.zeros(B, 0, dtype=torch.bool, device=self.device)
             
-            if isinstance(self.follower_actors[k], AttentionFollowerActorNet):
+            follower_actor, _ = self._follower_actor_for_index(k)
+            if isinstance(follower_actor, AttentionFollowerActorNet):
                 # Use attention Follower Actor network
-                act_k, log_prob_k = self.follower_actors[k].evaluate(
+                act_k, log_prob_k = follower_actor.evaluate(
                     follower_self_obs_k,
                     leader_for_context_k,
                     other_followers_context_k,
@@ -1153,7 +1169,7 @@ class MASACController:
                 )
             else:
                 # Use legacy Follower Actor network
-                act_k, log_prob_k = self.follower_actors[k].evaluate(follower_self_obs_k)
+                act_k, log_prob_k = follower_actor.evaluate(follower_self_obs_k)
             
             # Collect results
             new_act_followers_list.append(act_k.unsqueeze(1))  # Add follower dimension [B, 1, action_dim]
