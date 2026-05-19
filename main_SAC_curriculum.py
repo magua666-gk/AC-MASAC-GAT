@@ -1325,7 +1325,7 @@ class MASACController:
             return False
             
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             
             # Load Actor network parameters
             self.leader_actor.load_state_dict(checkpoint['leader_actor'], strict=strict)
@@ -1621,6 +1621,20 @@ def get_timestamp():
     """
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def create_timing_record(start_time, end_time=None):
+    """Create a serializable runtime record."""
+    if end_time is None:
+        end_time = time.time()
+    duration = max(0.0, end_time - start_time)
+    return {
+        "start_timestamp": float(start_time),
+        "end_timestamp": float(end_time),
+        "start_time": datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": datetime.datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_seconds": float(duration),
+        "duration_hms": str(datetime.timedelta(seconds=int(duration)))
+    }
+
 def convert_to_json_compatible(obj):
     """将对象转换为JSON兼容格式
     
@@ -1634,10 +1648,11 @@ def convert_to_json_compatible(obj):
     """
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, 
-                          np.uint8, np.uint16, np.uint32, np.uint64)):
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.integer):
         return int(obj)
-    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+    elif isinstance(obj, np.floating):
         return float(obj)
     elif isinstance(obj, (list, tuple)):
         return [convert_to_json_compatible(item) for item in obj]
@@ -1836,6 +1851,12 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         seed: 随机种子
         run_id: 运行ID，用于多次训练时区分不同的运行
     """
+    training_start_time = time.time()
+    training_run_timestamp = get_timestamp()
+    seed_suffix = f"_seed{seed}" if seed != 42 else ""
+    run_suffix = f"_run{run_id}" if run_id is not None else ""
+    training_run_name = f"train_{training_run_timestamp}{run_suffix}{seed_suffix}"
+
     # 设置随机种子
     set_seed(seed)
     print(f"设置随机种子: {seed}")
@@ -1848,7 +1869,15 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     ensure_dir_exists(RESULTS_DIR)
     ensure_dir_exists(TEST_RESULTS_BASE)
     ensure_dir_exists(os.path.dirname(TRAINING_RESULTS_FILE))
+    training_run_dir = ensure_dir_exists(os.path.join(RESULTS_DIR, "training_runs", training_run_name))
+    training_results_dir = ensure_dir_exists(os.path.join(training_run_dir, "results"))
+    models_base_dir = ensure_dir_exists(os.path.join(training_run_dir, "models"))
+    log(f"本次训练运行目录: {training_run_dir}", LOG_INFO)
     
+    # 创建模型基础目录；不删除旧模型，每次训练目录本身带时间戳
+    os.makedirs(models_base_dir, exist_ok=True)
+    log(f"模型目录已准备好: {models_base_dir}", LOG_INFO)
+
     # 初始化历史记录列表
     alpha_history = []
     reward_history = []
@@ -1859,14 +1888,6 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     all_ep_r0 = [[] for _ in range(TRAIN_NUM)]
     all_ep_r1 = [[] for _ in range(TRAIN_NUM)]
     k = 0  # 使用索引0，因为TRAIN_NUM=1
-    
-    # 模型保存在当前运行目录下，避免覆盖其他训练/测试模式
-    model_scope = f"run{run_id}_seed{seed}" if run_id is not None else None
-    models_base_dir = os.path.join(RESULTS_DIR, "model", model_scope) if model_scope else os.path.join(RESULTS_DIR, "model")
-    
-    # 创建模型基础目录；不删除旧模型，每次训练目录本身带时间戳
-    os.makedirs(models_base_dir, exist_ok=True)
-    log(f"模型目录已准备好: {models_base_dir}", LOG_INFO)
     
     # 设置日志级别
     
@@ -2409,7 +2430,11 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
                 "all_ep_F_std": all_ep_F_std,
                 "alpha_history": alpha_history,
                 "reward_history": reward_history,
-                "success_rate_history": success_rate_history
+                "success_rate_history": success_rate_history,
+                "run_timestamp": training_run_timestamp,
+                "run_dir": training_run_dir,
+                "models_dir": models_base_dir,
+                "timing": create_timing_record(training_start_time)
             }
             
             # 创建唯一的结果文件名（添加时间戳和课程步骤）
@@ -2418,10 +2443,10 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             run_suffix = f"_run{run_id}" if run_id is not None else ""
             # 确保最后一个任务使用正确的步骤编号（curriculum_step + 1，而不是 curriculum_step）
             result_filename = f"MASAC_curriculum_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.pkl"
-            result_path = os.path.join(TEST_RESULTS_BASE, result_filename)
+            result_path = os.path.join(training_results_dir, result_filename)
 
             # 确保结果目录存在
-            ensure_dir_exists(TEST_RESULTS_BASE)
+            ensure_dir_exists(training_results_dir)
             log(f"保存最终任务训练结果到 {result_path}", LOG_INFO)
             
             try:
@@ -2471,7 +2496,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             
             # 保存图表 - 使用与训练结果数据文件匹配的文件名（不含扩展名）
             plot_filename = f"MASAC_curriculum_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.png"
-            plot_path = os.path.join(TEST_RESULTS_BASE, plot_filename)
+            plot_path = os.path.join(training_results_dir, plot_filename)
             
             try:
                 plt.savefig(plot_path)
@@ -2550,7 +2575,11 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             "all_ep_F_std": all_ep_F_std,
             "alpha_history": alpha_history,
             "reward_history": reward_history,
-            "success_rate_history": success_rate_history
+            "success_rate_history": success_rate_history,
+            "run_timestamp": training_run_timestamp,
+            "run_dir": training_run_dir,
+            "models_dir": models_base_dir,
+            "timing": create_timing_record(training_start_time)
         }
         
         # 创建唯一的结果文件名（添加时间戳和课程步骤）
@@ -2558,10 +2587,10 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         seed_suffix = f"_seed{seed}" if seed != 42 else ""
         run_suffix = f"_run{run_id}" if run_id is not None else ""
         result_filename = f"MASAC_curriculum_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.pkl"
-        result_path = os.path.join(TEST_RESULTS_BASE, result_filename)
+        result_path = os.path.join(training_results_dir, result_filename)
 
         # 确保结果目录存在
-        ensure_dir_exists(TEST_RESULTS_BASE)
+        ensure_dir_exists(training_results_dir)
         log(f"保存训练结果到 {result_path}", LOG_INFO)
         
         try:
@@ -2611,7 +2640,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         
         # 保存图表 - 使用与训练结果数据文件匹配的文件名（不含扩展名）
         plot_filename = f"MASAC_curriculum_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.png"
-        plot_path = os.path.join(TEST_RESULTS_BASE, plot_filename)
+        plot_path = os.path.join(training_results_dir, plot_filename)
         
         try:
             plt.savefig(plot_path)
@@ -2637,6 +2666,9 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     # 训练完成，记录结果
     all_ep_r_mean = np.mean((np.array(all_ep_r)), axis=0)
     
+    training_end_time = time.time()
+    timing_record = create_timing_record(training_start_time, training_end_time)
+    
     # 构建最终训练结果并返回
     final_training_results = {
         'all_ep_r': all_ep_r,
@@ -2649,8 +2681,24 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         'run_id': run_id,
         'total_episodes': len(all_ep_r[0]) if all_ep_r[0] else 0,
         'curriculum_steps_completed': curriculum_step + 1,
-        'timestamp': get_timestamp()
+        'timestamp': get_timestamp(),
+        'run_timestamp': training_run_timestamp,
+        'run_dir': training_run_dir,
+        'models_dir': models_base_dir,
+        'results_dir': training_results_dir,
+        'timing': timing_record
     }
+
+    try:
+        summary_pkl_path = os.path.join(training_results_dir, "training_summary.pkl")
+        with open(summary_pkl_path, 'wb') as f:
+            pkl.dump(final_training_results, f, pkl.HIGHEST_PROTOCOL)
+        summary_json_path = os.path.join(training_results_dir, "training_summary.json")
+        with open(summary_json_path, 'w', encoding='utf-8') as f:
+            json.dump(convert_to_json_compatible(final_training_results), f, ensure_ascii=False, indent=4)
+        log(f"训练汇总已保存到: {summary_json_path}", LOG_INFO)
+    except Exception as e:
+        log(f"保存训练汇总时出错: {e}", LOG_ERROR)
     
     return final_training_results
 
@@ -2658,6 +2706,9 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
 def run_multi_seed_curriculum(args, initial_n_agent, initial_m_enemy):
 
     print("=== 多次课程学习训练模式 ===")
+    multi_run_start_time = time.time()
+    multi_run_timestamp = get_timestamp()
+    multi_run_dir = ensure_dir_exists(os.path.join(RESULTS_DIR, "training_runs", f"multi_run_{multi_run_timestamp}"))
     
     # 解析种子列表
     if args.seeds:
@@ -2749,9 +2800,10 @@ def run_multi_seed_curriculum(args, initial_n_agent, initial_m_enemy):
         print(f"平均总训练回合: {episodes_mean:.1f} ± {episodes_std:.1f}")
     
     # 保存汇总结果
-    timestamp = get_timestamp()
+    timestamp = multi_run_timestamp
     summary_filename = f"MASAC_curriculum_multi_run_summary_{timestamp}.pkl"
-    summary_path = os.path.join(RESULTS_DIR, summary_filename)
+    summary_path = os.path.join(multi_run_dir, summary_filename)
+    multi_run_timing = create_timing_record(multi_run_start_time)
     
     summary_results = {
         'num_runs': args.num_runs,
@@ -2782,6 +2834,8 @@ def run_multi_seed_curriculum(args, initial_n_agent, initial_m_enemy):
             }
         },
         'timestamp': timestamp,
+        'run_dir': multi_run_dir,
+        'timing': multi_run_timing,
         'config': {
             'initial_n_agent': initial_n_agent,
             'initial_m_enemy': initial_m_enemy,
@@ -2793,6 +2847,9 @@ def run_multi_seed_curriculum(args, initial_n_agent, initial_m_enemy):
     
     with open(summary_path, 'wb') as f:
         pkl.dump(summary_results, f)
+    summary_json_path = os.path.join(multi_run_dir, f"MASAC_curriculum_multi_run_summary_{timestamp}.json")
+    with open(summary_json_path, 'w', encoding='utf-8') as f:
+        json.dump(convert_to_json_compatible(summary_results), f, ensure_ascii=False, indent=4)
     
     print(f"\n多次课程学习训练汇总结果已保存: {summary_path}")
     print("多次课程学习训练完成！")

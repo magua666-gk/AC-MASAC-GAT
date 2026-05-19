@@ -1160,7 +1160,7 @@ class MASACController:
             return False
             
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             
             # 加载 Actor 网络参数
             self.leader_actor.load_state_dict(checkpoint['leader_actor'], strict=strict)

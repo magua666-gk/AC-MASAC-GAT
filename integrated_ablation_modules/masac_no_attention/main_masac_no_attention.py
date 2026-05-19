@@ -1082,7 +1082,7 @@ class MASACController:
             return False
             
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             
             # 检查并处理网络数量不匹配
             if 'num_follower_networks' in checkpoint:

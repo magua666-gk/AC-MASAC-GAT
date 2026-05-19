@@ -9,6 +9,8 @@ configure_matplotlib_fonts()
 from matplotlib import pyplot as plt
 import os
 import time
+import datetime
+import json
 import pickle as pkl
 
 RUN_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
@@ -55,6 +57,34 @@ def ensure_parent_dir(path):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+def create_timing_record(start_time, end_time=None):
+    if end_time is None:
+        end_time = time.time()
+    duration = max(0.0, end_time - start_time)
+    return {
+        "start_timestamp": float(start_time),
+        "end_timestamp": float(end_time),
+        "start_time": datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": datetime.datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_seconds": float(duration),
+        "duration_hms": str(datetime.timedelta(seconds=int(duration)))
+    }
+
+def convert_to_json_compatible(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {key: convert_to_json_compatible(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [convert_to_json_compatible(value) for value in obj]
+    return obj
 
 def latest_matching_file(directory, prefix, ext=".pth"):
     if not os.path.isdir(directory):
@@ -309,6 +339,13 @@ def run(env):
         print('SAC Testing...')
         
     if Switch==1:
+        training_start_time = time.time()
+        training_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        training_run_dir = DEFAULT_OUTPUT_DIR
+        results_dir = os.path.dirname(shoplistfile) or DEFAULT_OUTPUT_DIR
+        models_dir = default_model_dir
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(models_dir, exist_ok=True)
         all_ep_r = [[] for i in range(TRAIN_NUM)]
         all_ep_r0 = [[] for i in range(TRAIN_NUM)]
         all_ep_r1 = [[] for i in range(TRAIN_NUM)]
@@ -395,12 +432,22 @@ def run(env):
         all_ep_L_std = np.std((np.array(all_ep_r0)), axis=0)
         all_ep_F_mean = np.mean((np.array(all_ep_r1)), axis=0)
         all_ep_F_std = np.std((np.array(all_ep_r1)), axis=0)
+        timing_record = create_timing_record(training_start_time)
         d = {"all_ep_r_mean": all_ep_r_mean, "all_ep_r_std": all_ep_r_std,
              "all_ep_L_mean": all_ep_L_mean, "all_ep_L_std": all_ep_L_std,
-             "all_ep_F_mean": all_ep_F_mean, "all_ep_F_std": all_ep_F_std,}
+             "all_ep_F_mean": all_ep_F_mean, "all_ep_F_std": all_ep_F_std,
+             "run_timestamp": training_timestamp,
+             "run_dir": training_run_dir,
+             "models_dir": models_dir,
+             "results_dir": results_dir,
+             "timing": timing_record}
         ensure_parent_dir(shoplistfile)
         with open(shoplistfile, 'wb') as f:
             pkl.dump(d, f, pkl.HIGHEST_PROTOCOL)
+        summary_path = os.path.join(results_dir, "training_summary.json")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(convert_to_json_compatible(d), f, ensure_ascii=False, indent=4)
+        print(f"Training summary saved to: {summary_path}")
         all_ep_r_max = all_ep_r_mean + all_ep_r_std * 0.95
         all_ep_r_min = all_ep_r_mean - all_ep_r_std * 0.95
         all_ep_L_max = all_ep_L_mean + all_ep_L_std * 0.95
