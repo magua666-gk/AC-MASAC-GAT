@@ -2995,9 +2995,9 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     # 测试阶段启用 Leader safety shield
     if hasattr(env, "entity_manager"):
         env.entity_manager.enable_leader_safety_shield = True
-        env.entity_manager.leader_safe_distance = 32.0
-        env.entity_manager.leader_warning_distance = 95.0
-        env.entity_manager.leader_safety_horizon = 4
+        env.entity_manager.leader_safe_distance = 45.0
+        env.entity_manager.leader_warning_distance = 150.0
+        env.entity_manager.leader_safety_horizon = 6
         print("[Test] Leader safety shield enabled.")
     
     if hasattr(env, 'entity_manager') and hasattr(env.entity_manager, 'images_loaded'):
