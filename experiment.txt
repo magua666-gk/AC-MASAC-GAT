@@ -42,6 +42,7 @@ python main_SAC_curriculum.py --experiment_type curriculum --test --no_render
 
 # Main experiment multi-difficulty test
 python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test --no_render
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 4 --obstacle_count 4
 
 # Main experiment test with an explicit timestamped model file
 python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --model_path outputs/train/curriculum/<run_dir>/model/final/final_model_<timestamp>
