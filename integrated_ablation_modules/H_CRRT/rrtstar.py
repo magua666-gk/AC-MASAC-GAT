@@ -15,8 +15,8 @@ class CollisionChecker:
     a conservative default radius can be passed in by the caller.
     """
 
-    def __init__(self, obstacles: List[Tuple[float, float, float]]):
-        self.obstacles = obstacles
+    def __init__(self, obstacles: List[Tuple[float, float, float]], margin: float = 0.0):
+        self.obstacles = [(x, y, max(0.0, r + margin)) for x, y, r in obstacles]
 
     def point_free(self, p: Point) -> bool:
         x, y = p
@@ -29,16 +29,17 @@ class CollisionChecker:
         """Check if a segment intersects any obstacle (circle-line distance)."""
         x1, y1 = p1
         x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        denom = dx * dx + dy * dy
         for ox, oy, r in self.obstacles:
             # project obstacle center onto the segment
-            dx = x2 - x1
-            dy = y2 - y1
-            if dx == 0 and dy == 0:
+            if denom == 0:
                 # degenerate segment
                 if (x1 - ox) * (x1 - ox) + (y1 - oy) * (y1 - oy) <= r * r:
                     return False
                 continue
-            t = ((ox - x1) * dx + (oy - y1) * dy) / (dx * dx + dy * dy)
+            t = ((ox - x1) * dx + (oy - y1) * dy) / denom
             t = max(0.0, min(1.0, t))
             cx = x1 + t * dx
             cy = y1 + t * dy
@@ -72,9 +73,10 @@ class RRTStarPlanner:
         step_size: float = 22.0,
         goal_bias: float = 0.12,
         max_nodes: int = 1200,
+        obstacle_margin: float = 0.0,
     ):
         self.xmin, self.ymin, self.xmax, self.ymax = bounds
-        self.cc = CollisionChecker(obstacles)
+        self.cc = CollisionChecker(obstacles, margin=obstacle_margin)
         self.step_size = step_size
         self.goal_bias = goal_bias
         self.max_nodes = max_nodes
@@ -93,6 +95,12 @@ class RRTStarPlanner:
     def _dist(a: Point, b: Point) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
+    @staticmethod
+    def _dist2(a: Point, b: Point) -> float:
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        return dx * dx + dy * dy
+
     def _steer(self, from_p: Point, to_p: Point) -> Point:
         d = self._dist(from_p, to_p)
         if d <= self.step_size:
@@ -105,8 +113,11 @@ class RRTStarPlanner:
         # if start/goal inside obstacle, early return empty
         if not self.cc.point_free(start_xy) or not self.cc.point_free(goal_xy):
             return []
+        if self.cc.segment_free(start_xy, goal_xy):
+            return [start_xy, goal_xy]
 
         nodes: List[RRTStarPlanner._Node] = [self._Node(start_xy[0], start_xy[1], None, 0.0)]
+        neighbor_radius2 = self.neighbor_radius * self.neighbor_radius
 
         for _ in range(self.max_nodes):
             sample = self._sample(goal_xy)
@@ -115,7 +126,7 @@ class RRTStarPlanner:
             nearest_idx = 0
             best_d = float("inf")
             for i, nd in enumerate(nodes):
-                d = self._dist((nd.x, nd.y), sample)
+                d = self._dist2((nd.x, nd.y), sample)
                 if d < best_d:
                     best_d = d
                     nearest_idx = i
@@ -133,7 +144,7 @@ class RRTStarPlanner:
             best_parent = nearest_idx
             best_cost = nearest.cost + self._dist((nearest.x, nearest.y), new_pt)
             for i, nd in enumerate(nodes):
-                if self._dist((nd.x, nd.y), new_pt) <= self.neighbor_radius:
+                if self._dist2((nd.x, nd.y), new_pt) <= neighbor_radius2:
                     if self.cc.segment_free((nd.x, nd.y), new_pt):
                         c = nd.cost + self._dist((nd.x, nd.y), new_pt)
                         if c < best_cost:
@@ -145,7 +156,7 @@ class RRTStarPlanner:
 
             # rewire neighbors
             for i, nd in enumerate(nodes[:-1]):
-                if self._dist((nd.x, nd.y), new_pt) <= self.neighbor_radius:
+                if self._dist2((nd.x, nd.y), new_pt) <= neighbor_radius2:
                     new_cost = best_cost + self._dist(new_pt, (nd.x, nd.y))
                     if new_cost + 1e-6 < nd.cost and self.cc.segment_free(new_pt, (nd.x, nd.y)):
                         nd.parent = new_idx
@@ -180,6 +191,17 @@ class RRTStarPlanner:
         if len(path) <= 2:
             return path
         pts = list(path)
+
+        # Greedy shortcut first: repeatedly keep the farthest collision-free jump.
+        greedy: List[Point] = [pts[0]]
+        i = 0
+        while i < len(pts) - 1:
+            j = len(pts) - 1
+            while j > i + 1 and not self.cc.segment_free(pts[i], pts[j]):
+                j -= 1
+            greedy.append(pts[j])
+            i = j
+        pts = greedy
         
         for _ in range(iters):
             if len(pts) <= 2:
@@ -199,4 +221,3 @@ class RRTStarPlanner:
         if len(path) < 2:
             return 0.0
         return sum(self._dist(path[i], path[i+1]) for i in range(len(path)-1))
-

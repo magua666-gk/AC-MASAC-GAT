@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 
 # 导入动作边界常量
@@ -39,6 +38,10 @@ class SimpleLeaderActorNet(nn.Module):
         
         # 初始化权重
         self.apply(self._init_weights)
+        nn.init.uniform_(self.mean_layer.weight, -3e-3, 3e-3)
+        nn.init.uniform_(self.log_std_layer.weight, -3e-3, 3e-3)
+        nn.init.zeros_(self.mean_layer.bias)
+        nn.init.zeros_(self.log_std_layer.bias)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -60,7 +63,7 @@ class SimpleLeaderActorNet(nn.Module):
         features = self.feature_layers(state)
         
         # 生成均值（使用tanh限制范围并缩放到动作范围）
-        mean = torch.tanh(self.mean_layer(features)) * max_action
+        mean = self.mean_layer(features)
         
         # 计算对数标准差，并限制在合理范围内，避免训练不稳定
         log_std = self.log_std_layer(features)
@@ -134,7 +137,7 @@ class SimpleLeaderActorNet(nn.Module):
         z = dist.rsample()
         
         # 应用 tanh 变换
-        action = torch.tanh(z)
+        action = torch.clamp(torch.tanh(z), -0.99, 0.99)
         
         # 缩放到动作范围
         scaled_action = action * max_action
@@ -145,7 +148,7 @@ class SimpleLeaderActorNet(nn.Module):
         # 应用 tanh 校正项
         # log prob = log prob - log(1 - tanh(z)^2) 
         # = log prob - log(1 - action^2)
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob -= torch.log(torch.clamp(1 - action.pow(2), min=1e-4, max=1.0))
         
         # 对动作维度求和
         log_prob = log_prob.sum(dim=1, keepdim=True)
@@ -176,6 +179,10 @@ class SimpleFollowerActorNet(nn.Module):
         
         # 初始化权重
         self.apply(self._init_weights)
+        nn.init.uniform_(self.mean_layer.weight, -3e-3, 3e-3)
+        nn.init.uniform_(self.log_std_layer.weight, -3e-3, 3e-3)
+        nn.init.zeros_(self.mean_layer.bias)
+        nn.init.zeros_(self.log_std_layer.bias)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -197,7 +204,7 @@ class SimpleFollowerActorNet(nn.Module):
         features = self.feature_layers(state)
         
         # 生成均值（使用tanh限制范围并缩放到动作范围）
-        mean = torch.tanh(self.mean_layer(features)) * max_action
+        mean = self.mean_layer(features)
         
         # 计算对数标准差，并限制在合理范围内，避免训练不稳定
         log_std = self.log_std_layer(features)
@@ -271,7 +278,7 @@ class SimpleFollowerActorNet(nn.Module):
         z = dist.rsample()
         
         # 应用 tanh 变换
-        action = torch.tanh(z)
+        action = torch.clamp(torch.tanh(z), -0.99, 0.99)
         
         # 缩放到动作范围
         scaled_action = action * max_action
@@ -282,7 +289,7 @@ class SimpleFollowerActorNet(nn.Module):
         # 应用 tanh 校正项
         # log prob = log prob - log(1 - tanh(z)^2) 
         # = log prob - log(1 - action^2)
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob -= torch.log(torch.clamp(1 - action.pow(2), min=1e-4, max=1.0))
         
         # 对动作维度求和
         log_prob = log_prob.sum(dim=1, keepdim=True)

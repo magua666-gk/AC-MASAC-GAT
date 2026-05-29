@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
 # 定义角色ID常量
 LEADER_TYPE_ID = 0
@@ -174,6 +172,21 @@ class SimpleCriticNet(nn.Module):
         self.target_follower_aggregator.load_state_dict(self.follower_aggregator.state_dict())
         self.target_leader_q_head.load_state_dict(self.leader_q_head.state_dict())
         self.target_follower_q_head.load_state_dict(self.follower_q_head.state_dict())
+
+    @staticmethod
+    def _masked_mean(embeddings, mask):
+        if mask is None:
+            return embeddings.mean(dim=1)
+        if embeddings.shape[1] == 0:
+            return embeddings.new_zeros((embeddings.shape[0], embeddings.shape[2]))
+
+        mask = mask.to(device=embeddings.device, dtype=embeddings.dtype)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(-1)
+
+        masked_embeddings = embeddings * mask
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return masked_embeddings.sum(dim=1) / denom
     
     def forward(self, obs_leader, obs_followers, act_leader, act_followers, mask_followers):
         """前向传播
@@ -205,7 +218,7 @@ class SimpleCriticNet(nn.Module):
         
         # === Leader Q 值计算 ===
         # 计算 Follower 平均嵌入（替代注意力）
-        follower_avg = torch.mean(follower_embeddings, dim=1)  # [B, E]
+        follower_avg = self._masked_mean(follower_embeddings, mask_followers)  # [B, E]
         
         # 聚合 Leader 信息
         leader_context = torch.cat([leader_embedding, follower_avg], dim=-1)  # [B, E*2]
@@ -264,7 +277,7 @@ class SimpleCriticNet(nn.Module):
         
         # === Leader Q 值计算 ===
         # 计算 Follower 平均嵌入
-        follower_avg = torch.mean(follower_embeddings, dim=1)  # [B, E]
+        follower_avg = self._masked_mean(follower_embeddings, mask_followers)  # [B, E]
         
         # 聚合 Leader 信息
         leader_context = torch.cat([leader_embedding, follower_avg], dim=-1)  # [B, E*2]
@@ -319,4 +332,4 @@ class SimpleCriticNet(nn.Module):
         Args:
             tau: 软更新系数
         """
-        self.soft_update_targets(tau) 
+        self.soft_update_targets(tau)

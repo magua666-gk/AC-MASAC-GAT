@@ -72,8 +72,11 @@ class LeaderTracker:
 
         omega_cmd = self.w_gain * heading_error / max(dt, 1e-3)
 
-        # simple speed control: prefer mid of allowed range if moving towards target
-        v_ref = min(max(self.v_min, v), self.v_max)
+        # Speed control: move faster when the lookahead point is still far away,
+        # and slow down near the local target.
+        target_dist = math.hypot(tx - x, ty - y)
+        speed_ratio = min(1.0, target_dist / max(self.lookahead, 1e-6))
+        v_ref = self.v_min + (self.v_max - self.v_min) * speed_ratio
         a_cmd = self.a_gain * (v_ref - v) / max(dt, 1e-3)
 
         # normalize to environment action
@@ -111,11 +114,12 @@ class FollowerTracker:
         heading_error = _angle_normalize(desired_heading - theta)
         omega_cmd = self.w_gain * heading_error / max(dt, 1e-3)
 
-        # speed sync to leader (keep within follower range)
-        v_ref = max(self.v_min, min(self.v_max, leader_speed))
+        # Speed sync to leader with a mild catch-up term when the slot is far.
+        slot_error = math.hypot(sx - x, sy - y)
+        catch_up = max(-5.0, min(10.0, (slot_error - 20.0) * 0.2))
+        v_ref = max(self.v_min, min(self.v_max, leader_speed + catch_up))
         a_cmd = self.a_gain * (v_ref - v) / max(dt, 1e-3)
 
         a_norm = max(-1.0, min(1.0, a_cmd / 0.6))
         phi_norm = max(-1.0, min(1.0, omega_cmd / 1.2))
         return a_norm, phi_norm
-

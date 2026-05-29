@@ -9,32 +9,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 import json
 import uuid
 import random
 from visualization.matplotlib_fonts import configure_matplotlib_fonts
 configure_matplotlib_fonts()
 import matplotlib.pyplot as plt
-from tqdm.auto import tqdm, trange
 import pickle as pkl
 import re
 import sys
 import atexit
+import traceback
 from typing import Dict, Any
 
 # Import environment
 from rl_env.path_env import RlGame
 
 # Import network components
-from masac_adapter.role_specific_networks import RoleEmbedding, PolicyNetFlatRole, SharedEncoder, QHead, CriticNetAttentionFlat, ROLE_EMBED_DIM, EMBED_DIM
-from masac_adapter.masac_adapter import MASACEntroy,set_log_level, MultiHeadAttention, max_action, min_action, LEADER_TYPE_ID, FOLLOWER_TYPE_ID, log, LOG_INFO, LOG_WARNING, LOG_DEBUG, LOG_ERROR, clear_log_history
+from masac_adapter.masac_adapter import MASACEntroy, set_log_level, max_action, min_action, log, LOG_INFO, LOG_WARNING, LOG_DEBUG, LOG_ERROR, clear_log_history
 from main_SAC import Ornstein_Uhlenbeck_Noise
 from masac_adapter.smer_memory import SMERMemory
 
 # Import new Actor and Critic networks
-from masac_adapter.actor_networks import LeaderActorNet, FollowerActorNet, AttentionLeaderActorNet, AttentionFollowerActorNet
+from masac_adapter.actor_networks import AttentionLeaderActorNet, AttentionFollowerActorNet
 from masac_adapter.critic_networks import StructuredAttentionCriticNet
+from integrated_ablation_modules.masac_no_attention.actor_networks import SimpleLeaderActorNet, SimpleFollowerActorNet
+from integrated_ablation_modules.masac_no_attention.critic_networks import SimpleCriticNet
 
 # Import curriculum learning manager
 from curriculum import CurriculumManager, FixedTaskGenerator, CurriculumConfig, LinearTaskSequencer,PolicyTransfer
@@ -55,7 +55,7 @@ class MASACController:
     def __init__(self, n_agents=1, state_dim=17, action_dim=4, memory_size=int(2e6), \
             batch_size=256, gamma=0.99, tau=0.01, value_lr=3e-4, policy_lr=1e-4, \
             hidden_dim=256, target_update_interval=2, reward_scale=0.1, \
-            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, alpha_min=0.01, alpha_max=1.0, device=None, 
+            auto_entropy=False, entropy_lr=3e-4, target_entropy=-0.1, alpha_min=0.01, alpha_max=1.0, use_attention=True, device=None,
             memory_capacity=None, max_replay_ratio=10.0):  # Add max_replay_ratio parameter
         """Initialize role-based MASAC controller
         
@@ -89,6 +89,7 @@ class MASACController:
         self.reward_scale = reward_scale
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.auto_entropy = bool(auto_entropy)
+        self.use_attention = bool(use_attention)
         self.entropy_lr = entropy_lr # Save entropy_lr as instance attribute
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
@@ -107,7 +108,8 @@ class MASACController:
         else:
             self.memory_capacity = memory_size  # Save copy for reset_memory method
         
-        print(f"Initializing MASAC controller with graph attention (GAT): {n_agents} agents, state_dim={state_dim}/agent, action_dim={action_dim}/agent")
+        attention_label = "graph attention (GAT)" if self.use_attention else "simple MLP/no attention"
+        print(f"Initializing MASAC controller with {attention_label}: {n_agents} agents, state_dim={state_dim}/agent, action_dim={action_dim}/agent")
         print(f"Using device: {self.device}")
         print(f"Alpha mode: {'adaptive' if self.auto_entropy else 'fixed at 1.0'}")
         
@@ -132,28 +134,37 @@ class MASACController:
         actor_dropout = 0.1  # Dropout probability
         use_shared_layer = True  # Whether to use shared layer for fusion features
         
-        # === Create graph-attention-based Leader/Follower Actor networks ===
-        # Leader Actor network
-        self.leader_actor = AttentionLeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims,
-            n_heads=actor_n_heads,
-            dropout=actor_dropout,
-            use_shared_layer=use_shared_layer
-        )
-        
-        # Target Leader Actor network
-        self.target_leader_actor = AttentionLeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims,
-            n_heads=actor_n_heads,
-            dropout=actor_dropout,
-            use_shared_layer=use_shared_layer
-        )
+        # === Create Leader/Follower Actor networks ===
+        if self.use_attention:
+            self.leader_actor = AttentionLeaderActorNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                embed_dim=embed_dim,
+                hidden_dims=actor_hidden_dims,
+                n_heads=actor_n_heads,
+                dropout=actor_dropout,
+                use_shared_layer=use_shared_layer
+            )
+            self.target_leader_actor = AttentionLeaderActorNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                embed_dim=embed_dim,
+                hidden_dims=actor_hidden_dims,
+                n_heads=actor_n_heads,
+                dropout=actor_dropout,
+                use_shared_layer=use_shared_layer
+            )
+        else:
+            self.leader_actor = SimpleLeaderActorNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dims=actor_hidden_dims
+            )
+            self.target_leader_actor = SimpleLeaderActorNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dims=actor_hidden_dims
+            )
         
         # Load initial target Leader Actor parameters
         self.target_leader_actor.load_state_dict(self.leader_actor.state_dict())
@@ -162,86 +173,69 @@ class MASACController:
         max_followers = max(n_agents - 1, 3)  # Support at least 3 followers, or based on initial n_agents
         
         # Create separate Actor network for each possible follower
-        self.follower_actors = nn.ModuleList([
-            AttentionFollowerActorNet(
-                state_dim=state_dim,
-                action_dim=action_dim,
-                embed_dim=embed_dim,
-                hidden_dims=actor_hidden_dims,
-                n_heads=actor_n_heads,
-                dropout=actor_dropout,
-                use_shared_layer=use_shared_layer
-            ) for _ in range(max_followers)
-        ])
-        
-        # Create separate target Actor network for each possible follower
-        self.target_follower_actors = nn.ModuleList([
-            AttentionFollowerActorNet(
-                state_dim=state_dim,
-                action_dim=action_dim,
-                embed_dim=embed_dim,
-                hidden_dims=actor_hidden_dims,
-                n_heads=actor_n_heads,
-                dropout=actor_dropout,
-                use_shared_layer=use_shared_layer
-            ) for _ in range(max_followers)
-        ])
+        if self.use_attention:
+            self.follower_actors = nn.ModuleList([
+                AttentionFollowerActorNet(
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    embed_dim=embed_dim,
+                    hidden_dims=actor_hidden_dims,
+                    n_heads=actor_n_heads,
+                    dropout=actor_dropout,
+                    use_shared_layer=use_shared_layer
+                ) for _ in range(max_followers)
+            ])
+            self.target_follower_actors = nn.ModuleList([
+                AttentionFollowerActorNet(
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    embed_dim=embed_dim,
+                    hidden_dims=actor_hidden_dims,
+                    n_heads=actor_n_heads,
+                    dropout=actor_dropout,
+                    use_shared_layer=use_shared_layer
+                ) for _ in range(max_followers)
+            ])
+        else:
+            self.follower_actors = nn.ModuleList([
+                SimpleFollowerActorNet(
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    hidden_dims=actor_hidden_dims
+                ) for _ in range(max_followers)
+            ])
+            self.target_follower_actors = nn.ModuleList([
+                SimpleFollowerActorNet(
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    hidden_dims=actor_hidden_dims
+                ) for _ in range(max_followers)
+            ])
         
         # Load initial target Follower Actor parameters
         for i in range(max_followers):
             self.target_follower_actors[i].load_state_dict(self.follower_actors[i].state_dict())
-            
-        # Old LeaderActorNet and FollowerActorNet code (commented out)
-        """
-        # Leader Actor network
-        self.leader_actor = LeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
         
-        # Follower Actor network
-        self.follower_actor = FollowerActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        # Target Actor networks
-        self.target_leader_actor = LeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        self.target_follower_actor = FollowerActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        # Load initial target Actor parameters
-        self.target_leader_actor.load_state_dict(self.leader_actor.state_dict())
-        self.target_follower_actor.load_state_dict(self.follower_actor.state_dict())
-        """
-        
-        # === Create graph-attention Critic network ===
+        # === Create Critic network ===
         critic_hidden_dims = [256, 128]  # Critic hidden layer dimensions
         n_heads = 4  # Number of attention heads
         dropout = 0.1  # Dropout probability
         
-        self.critic = StructuredAttentionCriticNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            n_heads=n_heads,
-            hidden_dims=critic_hidden_dims,
-            dropout=dropout
-        )
+        if self.use_attention:
+            self.critic = StructuredAttentionCriticNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                embed_dim=embed_dim,
+                n_heads=n_heads,
+                hidden_dims=critic_hidden_dims,
+                dropout=dropout
+            )
+        else:
+            self.critic = SimpleCriticNet(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dims=critic_hidden_dims
+            )
         
         # === Initialize entropy adjustment ===
         # Leader and Follower each have an entropy parameter
@@ -277,10 +271,12 @@ class MASACController:
         critic_params = []
         critic_params.extend(list(self.critic.leader_encoder.parameters()))
         critic_params.extend(list(self.critic.follower_encoder.parameters()))
-        # Update: Use renamed leader_sees_followers_attention
-        critic_params.extend(list(self.critic.leader_sees_followers_attention.parameters()))
-        # Add: New follower_context_attention
-        critic_params.extend(list(self.critic.follower_context_attention.parameters()))
+        if self.use_attention:
+            critic_params.extend(list(self.critic.leader_sees_followers_attention.parameters()))
+            critic_params.extend(list(self.critic.follower_context_attention.parameters()))
+        else:
+            critic_params.extend(list(self.critic.leader_aggregator.parameters()))
+            critic_params.extend(list(self.critic.follower_aggregator.parameters()))
         critic_params.extend(list(self.critic.leader_q_head.parameters()))
         critic_params.extend(list(self.critic.follower_q_head.parameters()))
         
@@ -757,7 +753,7 @@ class MASACController:
                             evaluate=evaluate
                         )
                     else:
-                        # Compatible with old LeaderActorNet
+                        # Non-attention actor.
                         leader_action = self.leader_actor.choose_action(leader_state, evaluate=evaluate)
                     
                     # Add exploration noise
@@ -802,7 +798,7 @@ class MASACController:
                             evaluate=evaluate
                         )
                     else:
-                        # Compatible with old FollowerActorNet
+                        # Non-attention actor.
                         follower_action = follower_actor.choose_action(states_list[i], evaluate=evaluate)
                     
                     # Add exploration noise
@@ -1857,6 +1853,468 @@ def is_current_step_in_formation(env, distance_threshold=50.0):
     return True
 
 
+def _sum_reward_values(reward):
+    total = 0.0
+    if isinstance(reward, dict):
+        leader_reward = reward.get("leader", 0.0)
+        follower_rewards = reward.get("followers", [])
+        if isinstance(leader_reward, (int, float, np.number)):
+            total += float(leader_reward)
+        if isinstance(follower_rewards, list):
+            for item in follower_rewards:
+                if isinstance(item, (int, float, np.number)):
+                    total += float(item)
+    elif isinstance(reward, (list, tuple, np.ndarray)):
+        try:
+            total += float(np.sum(np.asarray(reward, dtype=float)))
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(reward, (int, float, np.number)):
+        total += float(reward)
+    return total
+
+
+def _leader_and_first_follower_rewards(reward):
+    leader_total = 0.0
+    first_follower_total = 0.0
+    if isinstance(reward, dict):
+        leader_reward = reward.get("leader", 0.0)
+        if isinstance(leader_reward, (int, float, np.number)):
+            leader_total = float(leader_reward)
+        follower_rewards = reward.get("followers", [])
+        if isinstance(follower_rewards, list) and follower_rewards:
+            first_reward = follower_rewards[0]
+            if isinstance(first_reward, (int, float, np.number)):
+                first_follower_total = float(first_reward)
+    return leader_total, first_follower_total
+
+
+def _format_distance_summary(distance):
+    if distance is None:
+        return "N/A"
+    if isinstance(distance, dict):
+        parts = []
+        if "leader_to_goal" in distance:
+            parts.append(f"goal={float(distance['leader_to_goal']):.2f}")
+        follower_distances = [
+            float(value)
+            for key, value in distance.items()
+            if str(key).startswith("leader_to_follower_")
+        ]
+        if follower_distances:
+            parts.append(f"follower={float(np.mean(follower_distances)):.2f}")
+        if "leader_to_obstacle" in distance:
+            parts.append(f"obstacle={float(distance['leader_to_obstacle']):.2f}")
+        return ", ".join(parts) if parts else "N/A"
+    if isinstance(distance, (list, tuple, np.ndarray)):
+        values = np.asarray(distance, dtype=float)
+        return f"{float(np.min(values)):.2f}" if values.size else "N/A"
+    if isinstance(distance, (int, float, np.number)):
+        return f"{float(distance):.2f}"
+    return str(distance)
+
+
+def _save_training_curve(rewards, success_rates, episode_lengths, alpha_history, output_path, title):
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    window_size = 50
+
+    axes[0, 0].plot(rewards, alpha=0.35, label="Raw Reward")
+    if len(rewards) >= window_size:
+        moving_avg = [np.mean(rewards[max(0, i - window_size):i + 1]) for i in range(len(rewards))]
+        axes[0, 0].plot(moving_avg, label=f"Moving Avg ({window_size})")
+    axes[0, 0].set_title(f"{title} - Rewards")
+    axes[0, 0].set_xlabel("Episode")
+    axes[0, 0].set_ylabel("Reward")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, linestyle="--", alpha=0.5)
+
+    axes[0, 1].plot(success_rates, alpha=0.35, label="Raw Success")
+    if len(success_rates) >= window_size:
+        moving_success = [np.mean(success_rates[max(0, i - window_size):i + 1]) for i in range(len(success_rates))]
+        axes[0, 1].plot(moving_success, label=f"Moving Avg ({window_size})")
+    axes[0, 1].set_title("Success Rate")
+    axes[0, 1].set_xlabel("Episode")
+    axes[0, 1].set_ylabel("Success")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, linestyle="--", alpha=0.5)
+
+    axes[1, 0].plot(episode_lengths, alpha=0.65, label="Episode Length")
+    axes[1, 0].set_title("Episode Length")
+    axes[1, 0].set_xlabel("Episode")
+    axes[1, 0].set_ylabel("Steps")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, linestyle="--", alpha=0.5)
+
+    axes[1, 1].plot(alpha_history, color="green", label="Alpha")
+    axes[1, 1].set_title("Temperature Coefficient Alpha")
+    axes[1, 1].set_xlabel("Episode")
+    axes[1, 1].set_ylabel("Alpha")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    ensure_dir_exists(os.path.dirname(output_path))
+    try:
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+
+def run_fixed_episode_training(args, n_agent, m_enemy, seed=42, run_id=None):
+    """Run the no-curriculum ablation with the current MASAC implementation."""
+    training_start_time = time.time()
+    training_run_timestamp = get_timestamp()
+    seed_suffix = f"_seed{seed}" if seed != 42 else ""
+    run_suffix = f"_run{run_id}" if run_id is not None else ""
+    training_run_name = f"fixed_train_{training_run_timestamp}{run_suffix}{seed_suffix}"
+
+    set_seed(seed)
+    print(f"设置随机种子: {seed}")
+    if run_id is not None:
+        print(f"训练运行ID: {run_id}")
+
+    global RESULTS_DIR, TEST_RESULTS_BASE, TRAINING_RESULTS_FILE, RENDER
+    RENDER = False
+    ensure_dir_exists(RESULTS_DIR)
+    ensure_dir_exists(TEST_RESULTS_BASE)
+    ensure_dir_exists(os.path.dirname(TRAINING_RESULTS_FILE))
+
+    training_run_dir = ensure_dir_exists(os.path.join(RESULTS_DIR, "training_runs", training_run_name))
+    training_results_dir = ensure_dir_exists(os.path.join(training_run_dir, "results"))
+    models_base_dir = ensure_dir_exists(os.path.join(training_run_dir, "models"))
+    log(f"本次无课程训练运行目录: {training_run_dir}", LOG_INFO)
+
+    max_episodes = int(getattr(args, "fixed_episodes", 800))
+    stage_tag = "fixed_no_curriculum"
+    stage_number = 0
+
+    print("使用固定任务进行无课程学习消融训练")
+    print(f"友方无人机数量: {n_agent}")
+    print(f"敌方无人机数量: {m_enemy}")
+    print(f"障碍物数量: {args.obstacle_count}")
+    print(f"固定训练回合数: {max_episodes}")
+
+    env = RlGame(
+        leader_count=n_agent,
+        follower_count=m_enemy,
+        obstacle_num=args.obstacle_count,
+        render=RENDER
+    ).unwrapped
+    env.set_time_step(1.0)
+    print("训练模式：时间步长dt设置为1.0")
+
+    n_agents = n_agent + m_enemy
+    masac_controller = MASACController(
+        n_agents=n_agents,
+        state_dim=state_number,
+        action_dim=action_number,
+        device=device,
+        memory_capacity=MemoryCapacity,
+        auto_entropy=getattr(args, "adaptive_alpha", False),
+        target_entropy=getattr(args, "target_entropy", -0.1),
+        alpha_min=getattr(args, "alpha_min", 0.01),
+        alpha_max=getattr(args, "alpha_max", 3.0),
+        use_attention=True,
+        max_replay_ratio=20
+    )
+
+    all_ep_r = [[] for _ in range(TRAIN_NUM)]
+    all_ep_r0 = [[] for _ in range(TRAIN_NUM)]
+    all_ep_r1 = [[] for _ in range(TRAIN_NUM)]
+    k = 0
+    alpha_history = []
+    reward_history = []
+    success_rate_history = []
+    episode_lengths = []
+    formation_rate_history = []
+    training_start_size = int(MemoryCapacity * 0.3)
+
+    try:
+        for episode in range(max_episodes):
+            print(f"回合 {episode + 1}/{max_episodes}")
+            observation = env.reset()
+            total_reward = 0.0
+            reward_totle0 = 0.0
+            reward_totle1 = 0.0
+            done = False
+            win = False
+            step_count = 0
+            team_formation_time = 0
+            last_distance = None
+            team_counter = 0
+
+            while not done and step_count < EP_LEN:
+                should_add_noise = episode < 20
+                action = masac_controller.select_actions(
+                    observation,
+                    add_noise=should_add_noise,
+                    noise_scale=0.1,
+                    evaluate=False
+                )
+                next_observation, reward, done, win, team_counter, distance = env.step(action)
+
+                masac_controller.store_transition(
+                    observation,
+                    action,
+                    reward,
+                    next_observation,
+                    done,
+                    current_stage_tag=stage_tag
+                )
+
+                last_distance = distance
+                observation = next_observation
+                total_reward += _sum_reward_values(reward)
+                leader_reward, first_follower_reward = _leader_and_first_follower_rewards(reward)
+                reward_totle0 += leader_reward
+                reward_totle1 += first_follower_reward
+                step_count += 1
+
+                if is_current_step_in_formation(env):
+                    team_formation_time += 1
+
+                if len(masac_controller.memory.buffer) > training_start_size:
+                    try:
+                        masac_controller.train(
+                            batch_size=BATCH,
+                            current_stage_tag=stage_tag,
+                            current_stage_number=stage_number
+                        )
+                    except Exception as e:
+                        print(f"训练过程中出现错误: {e}")
+                        traceback.print_exc()
+
+                if done:
+                    print(f"回合 {episode + 1} {'成功' if win else '失败'}")
+                    break
+
+            alpha_stats = []
+            if hasattr(masac_controller, "entroy_leader") and n_agents >= 1:
+                alpha_stats.append(masac_controller.entroy_leader.get_alpha_stats())
+            if hasattr(masac_controller, "entroy_follower") and n_agents > 1:
+                alpha_stats.append(masac_controller.entroy_follower.get_alpha_stats())
+            avg_alpha = np.mean([stat["current"] for stat in alpha_stats]) if alpha_stats else 0.0
+
+            formation_rate = team_formation_time / step_count if step_count > 0 else 0.0
+            success_value = float(win)
+
+            alpha_history.append(float(avg_alpha))
+            reward_history.append(float(total_reward))
+            success_rate_history.append(success_value)
+            episode_lengths.append(int(step_count))
+            formation_rate_history.append(float(formation_rate))
+            all_ep_r[k].append(float(total_reward))
+            all_ep_r0[k].append(float(reward_totle0))
+            all_ep_r1[k].append(float(reward_totle1))
+
+            masac_controller.track_episode_rewards([total_reward])
+            masac_controller.track_episode_length(step_count)
+            masac_controller.track_episode_success(win)
+
+            if episode % 10 == 0 or win:
+                leader_speeds = [f"{leader.speed:.1f}" for leader in env.entity_manager.leaders]
+                follower_speeds = [f"{follower.speed:.1f}" for follower in env.entity_manager.followers]
+                status = "成功" if win else "进行中"
+                log(
+                    f"回合摘要 - 固定任务, 回合: {episode + 1}/{max_episodes}, "
+                    f"状态: {status}, 步数: {step_count}, 总奖励: {total_reward:.1f}, "
+                    f"主机速度: [{', '.join(leader_speeds)}], "
+                    f"从机速度: [{', '.join(follower_speeds)}], "
+                    f"编队率: {formation_rate:.2f}, Alpha: {avg_alpha:.4f}, "
+                    f"重放比例: {masac_controller.replay_ratio}, "
+                    f"最终距离: {_format_distance_summary(last_distance)}",
+                    LOG_INFO
+                )
+
+            if (episode + 1) % 100 == 0:
+                save_dir = ensure_dir_exists(os.path.join(models_base_dir, "fixed_training"))
+                save_path = os.path.join(save_dir, f"model_ep{episode + 1}_{get_timestamp()}")
+                try:
+                    masac_controller.save_models(save_path)
+                except Exception as e:
+                    log(f"保存模型失败: {e}", LOG_ERROR)
+                    traceback.print_exc()
+
+                checkpoint_result = {
+                    "episode": episode + 1,
+                    "all_ep_r": all_ep_r,
+                    "all_ep_L": all_ep_r0,
+                    "all_ep_F": all_ep_r1,
+                    "reward_history": reward_history,
+                    "success_rate_history": success_rate_history,
+                    "formation_rate_history": formation_rate_history,
+                    "alpha_history": alpha_history,
+                    "run_timestamp": training_run_timestamp,
+                    "run_dir": training_run_dir,
+                    "models_dir": models_base_dir,
+                    "timing": create_timing_record(training_start_time)
+                }
+                result_path = os.path.join(
+                    training_results_dir,
+                    f"MASAC_no_curriculum_{get_timestamp()}{run_suffix}{seed_suffix}_episode_{episode + 1}.pkl"
+                )
+                with open(result_path, "wb") as f:
+                    pkl.dump(checkpoint_result, f, pkl.HIGHEST_PROTOCOL)
+
+                plot_path = os.path.splitext(result_path)[0] + ".png"
+                _save_training_curve(
+                    reward_history,
+                    success_rate_history,
+                    episode_lengths,
+                    alpha_history,
+                    plot_path,
+                    "MASAC No Curriculum"
+                )
+
+        final_save_dir = ensure_dir_exists(os.path.join(models_base_dir, "final"))
+        final_save_path = os.path.join(final_save_dir, f"final_model_{get_timestamp()}")
+        masac_controller.save_models(final_save_path)
+
+        training_end_time = time.time()
+        timing_record = create_timing_record(training_start_time, training_end_time)
+        final_training_results = {
+            "experiment_type": "no_curriculum",
+            "total_episodes": max_episodes,
+            "all_ep_r": all_ep_r,
+            "all_ep_L": all_ep_r0,
+            "all_ep_F": all_ep_r1,
+            "reward_history": reward_history,
+            "success_rate_history": success_rate_history,
+            "formation_rate_history": formation_rate_history,
+            "alpha_history": alpha_history,
+            "episode_lengths": episode_lengths,
+            "final_success_rate": float(np.mean(success_rate_history[-100:])) if success_rate_history else 0.0,
+            "final_avg_reward": float(np.mean(all_ep_r[k][-100:])) if all_ep_r[k] else 0.0,
+            "seed": seed,
+            "run_id": run_id,
+            "timestamp": get_timestamp(),
+            "run_timestamp": training_run_timestamp,
+            "run_dir": training_run_dir,
+            "models_dir": models_base_dir,
+            "results_dir": training_results_dir,
+            "final_model_path": final_save_path,
+            "training_config": {
+                "n_agent": n_agent,
+                "m_enemy": m_enemy,
+                "obstacle_count": args.obstacle_count,
+                "fixed_episodes": max_episodes,
+                "seed": seed,
+                "run_id": run_id,
+                "use_curriculum": False,
+                "use_attention": True
+            },
+            "timing": timing_record
+        }
+
+        summary_pkl_path = os.path.join(training_results_dir, "training_summary.pkl")
+        with open(summary_pkl_path, "wb") as f:
+            pkl.dump(final_training_results, f, pkl.HIGHEST_PROTOCOL)
+        summary_json_path = os.path.join(training_results_dir, "training_summary.json")
+        with open(summary_json_path, "w", encoding="utf-8") as f:
+            json.dump(convert_to_json_compatible(final_training_results), f, ensure_ascii=False, indent=4)
+
+        plot_path = os.path.join(training_results_dir, f"MASAC_no_curriculum_{get_timestamp()}{run_suffix}{seed_suffix}_final.png")
+        _save_training_curve(
+            reward_history,
+            success_rate_history,
+            episode_lengths,
+            alpha_history,
+            plot_path,
+            "MASAC No Curriculum"
+        )
+
+        print(f"最终训练结果已保存: {summary_json_path}")
+        print(f"最终模型已保存: {final_save_path}")
+        print("无课程学习固定轮数训练完成")
+        return final_training_results
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+
+
+def run_multi_seed_fixed_training(args, n_agent, m_enemy):
+    print("=== 多次无课程学习固定轮数训练模式 ===")
+    multi_run_start_time = time.time()
+    multi_run_timestamp = get_timestamp()
+    multi_run_dir = ensure_dir_exists(os.path.join(RESULTS_DIR, "training_runs", f"fixed_multi_run_{multi_run_timestamp}"))
+
+    if args.seeds:
+        try:
+            seeds = [int(s.strip()) for s in args.seeds.split(",")]
+            print(f"使用自定义种子: {seeds}")
+        except ValueError:
+            print("种子格式错误，使用默认种子")
+            seeds = [42, 123, 456][:args.num_runs]
+    else:
+        import random
+        random.seed(42)
+        seeds = [random.randint(1, 10000) for _ in range(args.num_runs)]
+        print(f"自动生成种子: {seeds}")
+
+    if len(seeds) != args.num_runs:
+        if len(seeds) < args.num_runs:
+            import random
+            random.seed(seeds[-1] if seeds else 42)
+            while len(seeds) < args.num_runs:
+                seeds.append(random.randint(1, 10000))
+        else:
+            seeds = seeds[:args.num_runs]
+        print(f"调整后的种子: {seeds}")
+
+    all_results = []
+    for i, seed in enumerate(seeds):
+        print(f"\n{'=' * 60}")
+        print(f"第 {i + 1}/{args.num_runs} 次无课程训练 - 种子: {seed}")
+        print(f"{'=' * 60}")
+        result = run_fixed_episode_training(args, n_agent, m_enemy, seed=seed, run_id=i + 1)
+        all_results.append(result)
+
+    final_rewards = [r.get("final_avg_reward", 0.0) for r in all_results if r]
+    final_success_rates = [r.get("final_success_rate", 0.0) for r in all_results if r]
+    total_episodes_list = [r.get("total_episodes", 0) for r in all_results if r]
+
+    summary_results = {
+        "experiment_type": "no_curriculum",
+        "num_runs": args.num_runs,
+        "seeds": seeds,
+        "individual_results": all_results,
+        "summary_stats": {
+            "final_rewards": {
+                "mean": float(np.mean(final_rewards)) if final_rewards else 0.0,
+                "std": float(np.std(final_rewards)) if final_rewards else 0.0,
+                "values": final_rewards
+            },
+            "final_success_rates": {
+                "mean": float(np.mean(final_success_rates)) if final_success_rates else 0.0,
+                "std": float(np.std(final_success_rates)) if final_success_rates else 0.0,
+                "values": final_success_rates
+            },
+            "total_episodes": {
+                "mean": float(np.mean(total_episodes_list)) if total_episodes_list else 0.0,
+                "std": float(np.std(total_episodes_list)) if total_episodes_list else 0.0,
+                "values": total_episodes_list
+            }
+        },
+        "timestamp": multi_run_timestamp,
+        "run_dir": multi_run_dir,
+        "timing": create_timing_record(multi_run_start_time)
+    }
+
+    summary_pkl_path = os.path.join(multi_run_dir, "multi_run_summary.pkl")
+    with open(summary_pkl_path, "wb") as f:
+        pkl.dump(summary_results, f, pkl.HIGHEST_PROTOCOL)
+    summary_json_path = os.path.join(multi_run_dir, "multi_run_summary.json")
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(convert_to_json_compatible(summary_results), f, ensure_ascii=False, indent=4)
+
+    print(f"多次无课程训练汇总已保存: {summary_json_path}")
+    return summary_results
+
+
 def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=None):
     """使用课程学习训练MASAC
     
@@ -2003,6 +2461,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         target_entropy=getattr(args, "target_entropy", -0.1),
         alpha_min=getattr(args, "alpha_min", 0.01),
         alpha_max=getattr(args, "alpha_max", 3.0),
+        use_attention=getattr(args, "experiment_type", "curriculum") != "no_attention",
         max_replay_ratio=20  # 允许较高的重放比例以减轻过拟合
     )
     print(
@@ -3008,7 +3467,13 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     n_agents = hero_count
     state_dim = state_number
     action_dim = action_number
-    masac_controller = MASACController(n_agents, state_dim, action_dim, device=device)
+    masac_controller = MASACController(
+        n_agents,
+        state_dim,
+        action_dim,
+        device=device,
+        use_attention=experiment_type != "no_attention"
+    )
     if not masac_controller.load_models(model_path, strict=False):
         raise RuntimeError(f"模型加载失败: {model_path}")
     
@@ -4078,7 +4543,13 @@ def _strip_dispatch_args(argv):
 
 
 def _filter_hcrrt_args(argv):
-    allowed_with_value = {"--hero_count", "--enemy_count", "--obstacle_count", "--test_episodes", "--replan_horizon", "--dt", "--results_dir", "--seed"}
+    allowed_with_value = {
+        "--hero_count", "--enemy_count", "--obstacle_count", "--test_episodes",
+        "--replan_horizon", "--replan_deviation", "--max_steps", "--dt",
+        "--results_dir", "--seed", "--rrt_step_size", "--rrt_goal_bias",
+        "--rrt_max_nodes", "--shortcut_iters", "--obstacle_margin",
+        "--formation_distance", "--formation_lateral"
+    }
     allowed_flags = {"--use_formation", "--no_use_formation", "--render", "--no_render"}
     cleaned = []
     i = 0
@@ -4103,37 +4574,9 @@ def _filter_hcrrt_args(argv):
             i += 1
     return cleaned
 
-def _prepare_integrated_module_defaults(module, experiment_type, results_dir):
-    """Initialize globals that used to be created in each standalone script's __main__ block."""
-    try:
-        module.set_seed(42)
-    except Exception:
-        pass
-    module.TRAIN_NUM = getattr(module, "TRAIN_NUM", 1)
-    module.TEST_EPIOSDE = getattr(module, "TEST_EPIOSDE", 100)
-    module.state_number = getattr(module, "state_number", 7)
-    module.action_number = getattr(module, "action_number", 2)
-    module.N_Agent = getattr(module, "N_Agent", 1)
-    module.M_Enemy = getattr(module, "M_Enemy", 3)
-    module.EP_LEN = getattr(module, "EP_LEN", 1000)
-    module.MemoryCapacity = getattr(module, "MemoryCapacity", 50000)
-    module.BATCH = getattr(module, "BATCH", 256)
-    module.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    module.RESULTS_DIR = results_dir
-    module.TEST_RESULTS_BASE = os.path.join(results_dir, "test_results")
-    if experiment_type == "no_attention":
-        module.TRAINING_RESULTS_FILE = os.path.join(results_dir, _timestamped_filename("MASAC_no_attention_curriculum", ".pkl"))
-    elif experiment_type == "no_curriculum":
-        module.TRAINING_RESULTS_FILE = os.path.join(results_dir, _timestamped_filename("MASAC_no_curriculum", ".pkl"))
-    else:
-        module.TRAINING_RESULTS_FILE = os.path.join(results_dir, _timestamped_filename(experiment_type, ".pkl"))
-    ensure_dir_exists(module.RESULTS_DIR)
-    ensure_dir_exists(module.TEST_RESULTS_BASE)
-    ensure_dir_exists(os.path.dirname(module.TRAINING_RESULTS_FILE))
-
 def _delegate_integrated_experiment(experiment_type, original_argv):
     """Run ablation/baseline implementations from the unified main entry."""
-    mode = "test" if ("--test" in original_argv or "--multi_difficulty_test" in original_argv) else "train"
+    mode = "test" if experiment_type == "h_crrt" or ("--test" in original_argv or "--multi_difficulty_test" in original_argv) else "train"
     argv = _strip_dispatch_args(original_argv)
     # Give every experiment its own timestamped result folder when the user does not provide one.
     if "--results_dir" not in argv and not any(a.startswith("--results_dir=") for a in argv):
@@ -4152,16 +4595,6 @@ def _delegate_integrated_experiment(experiment_type, original_argv):
         from integrated_ablation_modules.H_CRRT import run_hcrrt as hcrrt_main
         target_module = hcrrt_main
         target_main = hcrrt_main.main
-    elif experiment_type == "no_attention":
-        if not any(flag in argv for flag in ["--use_curriculum", "--test", "--multi_difficulty_test", "--analyze", "--create_index"]):
-            argv.append("--use_curriculum")
-        from integrated_ablation_modules.masac_no_attention import main_masac_no_attention as no_attention_main
-        target_module = no_attention_main
-        target_main = no_attention_main.main
-    elif experiment_type == "no_curriculum":
-        from integrated_ablation_modules.masac_no_curriculum import main_masac_no_curriculum as no_curriculum_main
-        target_module = no_curriculum_main
-        target_main = no_curriculum_main.main
     else:
         raise ValueError(f"未知实验类型: {experiment_type}")
 
@@ -4172,8 +4605,6 @@ def _delegate_integrated_experiment(experiment_type, original_argv):
         elif item.startswith("--results_dir="):
             results_dir = item.split("=", 1)[1]
     results_dir = results_dir or _make_timestamped_results_dir(experiment_type, mode)
-    if experiment_type in ["no_attention", "no_curriculum"]:
-        _prepare_integrated_module_defaults(target_module, experiment_type, results_dir)
     _register_run_timer(results_dir, experiment_type, mode)
 
     old_argv = sys.argv[:]
@@ -4192,7 +4623,7 @@ def main():
                             help='统一入口实验类型：curriculum/standard/no_attention/no_curriculum/h_crrt')
     pre_parser.add_argument('--run_tag', type=str, default=None, help='可选运行标记，会写入时间记录')
     pre_args, _ = pre_parser.parse_known_args()
-    if pre_args.experiment_type in ['no_attention', 'no_curriculum', 'h_crrt']:
+    if pre_args.experiment_type in ['h_crrt']:
         return _delegate_integrated_experiment(pre_args.experiment_type, sys.argv[1:])
 
     # 添加命令行参数解析
@@ -4253,11 +4684,17 @@ def main():
                        help='自定义随机种子列表，格式为逗号分隔的数字，例如"42,123,456"。如不指定则自动生成')
     parser.add_argument('--seed', type=int, default=42,
                        help='单次训练或测试使用的随机种子，默认为42')
+    parser.add_argument('--fixed_episodes', type=int, default=800,
+                       help='no_curriculum实验的固定训练回合数，默认800')
                        
     args = parser.parse_args()
     set_seed(args.seed)
     print(f"设置随机种子: {args.seed}")
     if args.experiment_type == 'standard':
+        args.use_curriculum = False
+    elif args.experiment_type == 'no_attention':
+        args.use_curriculum = True
+    elif args.experiment_type == 'no_curriculum':
         args.use_curriculum = False
     mode = 'test' if (args.test or args.multi_difficulty_test) else 'train'
     if args.results_dir is None:
@@ -4394,7 +4831,14 @@ def main():
         )
     else:
         # 训练模式
-        if args.use_curriculum:
+        if args.experiment_type == 'no_curriculum':
+            if args.multi_run:
+                print("使用多次无课程学习固定轮数训练")
+                run_multi_seed_fixed_training(args, n_agent, m_enemy)
+            else:
+                print("使用单次无课程学习固定轮数训练")
+                run_fixed_episode_training(args, n_agent, m_enemy, seed=args.seed)
+        elif args.use_curriculum:
             if args.multi_run:
                 print("使用多次课程学习框架进行训练")
                 # 传递 n_agent 和 m_enemy 给 run_multi_seed_curriculum

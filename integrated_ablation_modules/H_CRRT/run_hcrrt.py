@@ -11,7 +11,7 @@ from typing import List, Tuple
 import numpy as np
 
 # Allow running as script from within H_CRRT directory by adding project root to sys.path
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -57,6 +57,50 @@ def _euclid(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _build_obstacles(env, default_radius: float = 20.0) -> List[Tuple[float, float, float]]:
+    obstacles = []
+    for ob in env.entity_manager.obstacles:
+        radius = getattr(ob, "radius", default_radius)
+        obstacles.append((float(ob.pos_x), float(ob.pos_y), float(radius)))
+    return obstacles
+
+
+def _distance_to_segment(p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-9:
+        return _euclid(p, a)
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    return _euclid(p, (ax + t * dx, ay + t * dy))
+
+
+def _distance_to_path(p: Tuple[float, float], path: List[Tuple[float, float]]) -> float:
+    if not path:
+        return float("inf")
+    if len(path) == 1:
+        return _euclid(p, path[0])
+    return min(_distance_to_segment(p, path[i], path[i + 1]) for i in range(len(path) - 1))
+
+
+def _extract_final_distance(distance_info) -> float:
+    if isinstance(distance_info, dict):
+        if "leader_to_goal" in distance_info:
+            return float(distance_info["leader_to_goal"])
+        values = [float(v) for v in distance_info.values() if isinstance(v, (int, float, np.number))]
+        return float(np.mean(values)) if values else 0.0
+    if isinstance(distance_info, (list, tuple, np.ndarray)):
+        values = np.asarray(distance_info, dtype=float)
+        return float(np.min(values)) if values.size else 0.0
+    if isinstance(distance_info, (int, float, np.number)):
+        return float(distance_info)
+    return 0.0
+
+
 def _pump_pygame_events(render_enabled: bool) -> None:
     """Pump pygame events to prevent window from becoming unresponsive.
 
@@ -83,6 +127,15 @@ def main():
     ap.add_argument("--no_use_formation", dest="use_formation", action="store_false")
     ap.set_defaults(use_formation=True)
     ap.add_argument("--replan_horizon", type=int, default=0)
+    ap.add_argument("--replan_deviation", type=float, default=70.0)
+    ap.add_argument("--max_steps", type=int, default=1000)
+    ap.add_argument("--rrt_step_size", type=float, default=24.0)
+    ap.add_argument("--rrt_goal_bias", type=float, default=0.16)
+    ap.add_argument("--rrt_max_nodes", type=int, default=900)
+    ap.add_argument("--shortcut_iters", type=int, default=120)
+    ap.add_argument("--obstacle_margin", type=float, default=8.0)
+    ap.add_argument("--formation_distance", type=float, default=45.0)
+    ap.add_argument("--formation_lateral", type=float, default=10.0)
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--results_dir", type=str, default="results")
     ap.add_argument("--render", dest="render", action="store_true")
@@ -107,15 +160,7 @@ def main():
     leader = env.entity_manager.leaders[0]
     goal = env.entity_manager.goals[0]
 
-    # Build obstacle list (x, y, R). If radius not explicit, use conservative 20.0
-    obstacles = []
-    default_r = 20.0
-    for ob in env.entity_manager.obstacles:
-        r = getattr(ob, "radius", default_r)
-        obstacles.append((float(ob.pos_x), float(ob.pos_y), float(r)))
-
     bounds = (100.0, 100.0, 600.0, 500.0)
-    planner = RRTStarPlanner(bounds, obstacles, step_size=22.0, goal_bias=0.12, max_nodes=1200)
 
     # Metrics accumulators
     wins = 0
@@ -126,12 +171,23 @@ def main():
     path_len_all = []
     energy_all = []
     avg_abs_omega_all = []
+    planning_time_all = []
+    waypoint_count_all = []
 
     for ep in range(args.test_episodes):
         obs = env.reset()
         # re-pull references
         leader = env.entity_manager.leaders[0]
         goal = env.entity_manager.goals[0]
+        obstacles = _build_obstacles(env)
+        planner = RRTStarPlanner(
+            bounds,
+            obstacles,
+            step_size=args.rrt_step_size,
+            goal_bias=args.rrt_goal_bias,
+            max_nodes=args.rrt_max_nodes,
+            obstacle_margin=args.obstacle_margin,
+        )
         # Render initial frame if enabled
         if args.render:
             try:
@@ -142,11 +198,14 @@ def main():
         start = (float(leader.pos_x), float(leader.pos_y))
         target = (float(goal.pos_x), float(goal.pos_y))
 
+        plan_start = time.perf_counter()
         path = planner.plan(start, target)
+        planning_time = time.perf_counter() - plan_start
         if not path:
             path = [start, target]
         else:
-            path = planner.shortcut(path)
+            path = planner.shortcut(path, iters=args.shortcut_iters)
+        waypoint_count_all.append(len(path))
 
         leader_tracker = LeaderTracker()
         follower_tracker = FollowerTracker()
@@ -162,9 +221,7 @@ def main():
         formation_samples = 0
         win = False
 
-        last_leader_pos = (float(leader.pos_x), float(leader.pos_y))
-
-        while not done and total_steps < 1000:
+        while not done and total_steps < args.max_steps:
             # Pump render events when visualization is enabled
             _pump_pygame_events(args.render)
             # Leader action
@@ -176,7 +233,11 @@ def main():
             # Followers actions
             if args.use_formation and env.entity_manager.followers:
                 slots = get_multi_slots(
-                    (float(leader.pos_x), float(leader.pos_y)), float(leader.theta), len(env.entity_manager.followers)
+                    (float(leader.pos_x), float(leader.pos_y)),
+                    float(leader.theta),
+                    len(env.entity_manager.followers),
+                    dist_back=args.formation_distance,
+                    lateral=args.formation_lateral,
                 )
                 for f, slot in zip(env.entity_manager.followers, slots):
                     st_f = _collect_state(f)
@@ -191,7 +252,9 @@ def main():
                         formation_window_hits += 1
 
             # step
+            prev_leader_pos = (float(leader.pos_x), float(leader.pos_y))
             obs, reward, done, win, team_counter, dis = env.step(actions)
+            current_leader_pos = (float(leader.pos_x), float(leader.pos_y))
 
             # accumulate metrics
             total_steps += 1
@@ -210,8 +273,8 @@ def main():
                 r_sum += float(reward)
             total_reward += r_sum
 
-            # path length increment via integral of speed
-            total_path_len += float(st_leader["speed"]) * float(args.dt)
+            # path length increment from actual displacement
+            total_path_len += _euclid(prev_leader_pos, current_leader_pos)
 
             # energy integral with de-normalized commands and dt
             # leader
@@ -226,12 +289,17 @@ def main():
                 omega_cmd_F = float(phi_norm) * 1.2
                 total_energy += (abs(a_cmd_F) + abs(omega_cmd_F)) * float(args.dt)
 
-            # simple periodic replan if enabled
-            if args.replan_horizon > 0 and (total_steps % args.replan_horizon == 0):
+            # Periodic or deviation-triggered replan if enabled.
+            should_replan = args.replan_horizon > 0 and (total_steps % args.replan_horizon == 0)
+            if args.replan_deviation > 0 and _distance_to_path(current_leader_pos, path) > args.replan_deviation:
+                should_replan = True
+            if should_replan:
                 start = (float(leader.pos_x), float(leader.pos_y))
+                plan_start = time.perf_counter()
                 path_new = planner.plan(start, target)
+                planning_time += time.perf_counter() - plan_start
                 if path_new:
-                    path = planner.shortcut(path_new)
+                    path = planner.shortcut(path_new, iters=args.shortcut_iters)
 
             # render this step if enabled (align with main_SAC_curriculum behavior)
             if args.render:
@@ -243,7 +311,7 @@ def main():
         wins += 1 if win else 0
         rewards_all.append(total_reward)
         steps_all.append(total_steps)
-        final_dist_all.append(float(dis) if isinstance(dis, (float, int, np.number)) else 0.0)
+        final_dist_all.append(_extract_final_distance(dis))
         if args.use_formation and formation_samples > 0:
             formation_rates_all.append(formation_window_hits / float(formation_samples))
         else:
@@ -251,6 +319,7 @@ def main():
         path_len_all.append(total_path_len)
         energy_all.append(total_energy)
         avg_abs_omega_all.append(omega_abs_sum / float(max(1, omega_count)))
+        planning_time_all.append(planning_time)
 
     # aggregate
     success_rate = wins / float(args.test_episodes)
@@ -267,11 +336,22 @@ def main():
         "path_length": {"mean": float(np.mean(path_len_all)), "std": float(np.std(path_len_all))},
         "energy": {"mean": float(np.mean(energy_all)), "std": float(np.std(energy_all))},
         "avg_abs_omega": {"mean": float(np.mean(avg_abs_omega_all)), "std": float(np.std(avg_abs_omega_all))},
+        "planning_time": {"mean": float(np.mean(planning_time_all)), "std": float(np.std(planning_time_all))},
+        "path_waypoints": {"mean": float(np.mean(waypoint_count_all)), "std": float(np.std(waypoint_count_all))},
         "test_config": {
             "hero_count": args.hero_count,
             "enemy_count": args.enemy_count,
             "obstacle_count": args.obstacle_count,
             "uav_speed": None,
+            "rrt_step_size": args.rrt_step_size,
+            "rrt_goal_bias": args.rrt_goal_bias,
+            "rrt_max_nodes": args.rrt_max_nodes,
+            "shortcut_iters": args.shortcut_iters,
+            "obstacle_margin": args.obstacle_margin,
+            "replan_horizon": args.replan_horizon,
+            "replan_deviation": args.replan_deviation,
+            "formation_distance": args.formation_distance,
+            "formation_lateral": args.formation_lateral,
         },
         "timestamp": time.time(),
     }
@@ -333,4 +413,3 @@ def print_five_metrics(metrics):
 
 if __name__ == "__main__":
     main()
-

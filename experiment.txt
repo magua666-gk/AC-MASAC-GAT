@@ -1,63 +1,58 @@
-# Training commands
+# Experiment commands
 
-# 1. Main experiment: MASAC + attention + curriculum learning
+# 1. Main experiment: MASAC + GAT attention + curriculum learning
 python main_SAC_curriculum.py --experiment_type curriculum --use_curriculum
 
-# Optional: enable adaptive alpha instead of the default fixed alpha=1
-python main_SAC_curriculum.py --experiment_type curriculum --use_curriculum --adaptive_alpha
+# Optional: adaptive alpha instead of fixed alpha=1.0
+python main_SAC_curriculum.py --experiment_type curriculum --use_curriculum --adaptive_alpha --target_entropy -0.1 --alpha_max 1.0
 
-# 2. Standard MASAC: no curriculum learning
-python main_SAC_curriculum.py --experiment_type standard
-
-# Standard MASAC with adaptive alpha
-python main_SAC_curriculum.py --experiment_type standard --adaptive_alpha
-
-# 3. Ablation: no attention, with curriculum learning
+# 2. Ablation: no attention, with curriculum learning
+# This uses the current main pipeline and only replaces GAT with simple MLP aggregation.
 python main_SAC_curriculum.py --experiment_type no_attention
 
-# 4. Ablation: attention, no curriculum learning
-python main_SAC_curriculum.py --experiment_type no_curriculum
+# 3. Ablation: GAT attention, no curriculum learning
+# This uses the current main pipeline and trains one fixed task for a fixed number of episodes.
+python main_SAC_curriculum.py --experiment_type no_curriculum --fixed_episodes 800
+
+# 4. H-CRRT traditional baseline test
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render
+
+# Faster H-CRRT smoke/preview run
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 20 --no_render --rrt_max_nodes 500 --shortcut_iters 50
+
+# Higher-quality H-CRRT baseline run
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render --rrt_max_nodes 1500 --shortcut_iters 200 --replan_horizon 50
+
+
+# Test commands
+
+# Main experiment single-difficulty test.
+# If --model_path is omitted, the latest model under outputs/train/curriculum/ is selected automatically.
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3  --obstacle_count 2
+
+# Main experiment multi-difficulty test
+python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test --no_render --test_episodes 100
+
+# No-attention test. If --model_path is omitted, the latest no_attention model is selected automatically.
+python main_SAC_curriculum.py --experiment_type no_attention --test --no_render --test_episodes 100
+
+# No-curriculum test. If --model_path is omitted, the latest no_curriculum model is selected automatically.
+python main_SAC_curriculum.py --experiment_type no_curriculum --test --no_render --test_episodes 100
+
+# Explicit model path example
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --model_path outputs/train/curriculum/<run_dir>/training_runs/<train_run>/models/final/final_model_<timestamp>
 
 
 # Output layout
 
 # Training outputs:
 # outputs/train/<experiment>/<experiment>_train_<YYYYMMDD_HHMMSS>/
-#
+
 # Test outputs:
 # outputs/test/<experiment>/<experiment>_test_<YYYYMMDD_HHMMSS>/
-#
-# Curriculum model example:
-# outputs/train/curriculum/curriculum_train_20260511_153000/model/final/final_model_20260511_153000
 
-
-# Test commands
-
-# 5. H-CRRT baseline test
-python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render
-
-# Main experiment single-difficulty test.
-# If --model_path is omitted, the latest model under outputs/train/curriculum/ is selected automatically.
-python main_SAC_curriculum.py --experiment_type curriculum --test --no_render
-
-# Main experiment multi-difficulty test
-python main_SAC_curriculum.py --experiment_type curriculum --multi_difficulty_test --no_render
-python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 4 --obstacle_count 4
-
-# Main experiment test with an explicit timestamped model file
-python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --model_path outputs/train/curriculum/<run_dir>/model/final/final_model_<timestamp>
-
-# no_attention test
-python main_SAC_curriculum.py --experiment_type no_attention --test --no_render --model_path outputs/train/no_attention/<run_dir>/model/final/final_model_<timestamp>
-
-# no_curriculum test
-python main_SAC_curriculum.py --experiment_type no_curriculum --test --no_render --model_path outputs/train/no_curriculum/<run_dir>/model/final/final_model_<timestamp>
-
-# 固定 alpha=1，对照组
-python main_SAC_curriculum.py --use_curriculum
-
-# 论文式自适应 alpha，但限制最大值
-python main_SAC_curriculum.py --use_curriculum --adaptive_alpha --target_entropy -0.1 --alpha_max 1.0
-
-# 更稳定的自适应 alpha
-python main_SAC_curriculum.py --use_curriculum --adaptive_alpha --target_entropy -2.0 --alpha_max 1.0
+# Current aligned experiments:
+# curriculum      : GAT + curriculum learning
+# no_attention    : simple MLP aggregation + curriculum learning
+# no_curriculum   : GAT + fixed-episode training without curriculum learning
+# h_crrt          : traditional H-CRRT baseline, test-only
