@@ -47,12 +47,13 @@ class EntityManager:
         # Leader safety shield parameters
         # 只对主无人机动作做安全兜底，不改变观测维度、奖励函数和终止条件
         self.enable_leader_safety_shield = False
-        # 撞障碍物的真实判定阈值是 20，这里安全距离要略大于 20
-        self.leader_safe_distance = 32.0
+        # 撞障碍物的真实判定阈值是 20；测试默认采用灵敏度实验选定的折中参数
+        self.leader_safe_distance = 45.0
         # 进入预警区后才启动动作筛选，避免一直干预正常策略
-        self.leader_warning_distance = 95.0
+        self.leader_warning_distance = 150.0
         # 向前预测多少步，越大越保守，但会稍微影响路径效率
-        self.leader_safety_horizon = 4
+        self.leader_safety_horizon = 10
+        self.reset_leader_safety_stats()
         
         # Create entities
         self._create_entities()
@@ -145,7 +146,18 @@ class EntityManager:
             leader = self.leaders[0]
     
             if self.enable_leader_safety_shield:
-                leader_action = self._leader_action_safety_filter(leader, leader_action)
+                raw_leader_action = np.asarray(leader_action, dtype=np.float32).reshape(-1)
+                if raw_leader_action.size < 2:
+                    raw_leader_action = np.zeros(2, dtype=np.float32)
+                raw_leader_action = np.clip(raw_leader_action[:2], -1.0, 1.0)
+                leader_action = self._leader_action_safety_filter(leader, raw_leader_action)
+                action_delta = float(np.linalg.norm(np.asarray(leader_action, dtype=np.float32)[:2] - raw_leader_action))
+                self.leader_safety_filter_calls += 1
+                self.leader_safety_action_delta_sum += action_delta
+                self.leader_safety_action_delta_values.append(action_delta)
+                if action_delta > 1e-6:
+                    self.leader_safety_interventions += 1
+                    self.leader_safety_intervention_delta_sum += action_delta
     
             self.leaders[0].apply_action(leader_action)
         
@@ -157,6 +169,29 @@ class EntityManager:
     def _wrap_angle(self, angle):
         """Wrap angle to [-pi, pi]."""
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+    def reset_leader_safety_stats(self):
+        """Reset accumulated Leader safety shield diagnostics."""
+        self.leader_safety_filter_calls = 0
+        self.leader_safety_interventions = 0
+        self.leader_safety_action_delta_sum = 0.0
+        self.leader_safety_intervention_delta_sum = 0.0
+        self.leader_safety_action_delta_values = []
+
+
+    def get_leader_safety_stats(self):
+        """Return accumulated Leader safety shield diagnostics."""
+        calls = int(self.leader_safety_filter_calls)
+        interventions = int(self.leader_safety_interventions)
+        return {
+            "filter_calls": calls,
+            "interventions": interventions,
+            "intervention_rate": float(interventions / calls) if calls else 0.0,
+            "mean_action_delta": float(self.leader_safety_action_delta_sum / calls) if calls else 0.0,
+            "mean_intervention_action_delta": float(self.leader_safety_intervention_delta_sum / interventions) if interventions else 0.0,
+            "action_delta_values": [float(value) for value in self.leader_safety_action_delta_values],
+        }
     
     
     def _predict_leader_trajectory(self, leader, action, horizon=None):

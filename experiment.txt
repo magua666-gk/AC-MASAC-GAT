@@ -15,19 +15,20 @@ python main_SAC_curriculum.py --experiment_type no_attention
 python main_SAC_curriculum.py --experiment_type no_curriculum --fixed_episodes 800
 
 # 4. H-CRRT traditional baseline test
-python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render --obstacle_count 2
 
 # Faster H-CRRT smoke/preview run
-python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 20 --no_render --rrt_max_nodes 500 --shortcut_iters 50
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 20 --no_render --obstacle_count 2 --rrt_max_nodes 500 --shortcut_iters 50
 
 # Higher-quality H-CRRT baseline run
-python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render --rrt_max_nodes 1500 --shortcut_iters 200 --replan_horizon 50
+python main_SAC_curriculum.py --experiment_type h_crrt --test_episodes 100 --no_render --obstacle_count 2 --rrt_max_nodes 1500 --shortcut_iters 200 --replan_horizon 50
 
 
 # Test commands
 
 # Main experiment single-difficulty test.
 # If --model_path is omitted, the latest model under outputs/train/curriculum/ is selected automatically.
+# Safety shield default: leader_safe_distance=45, leader_warning_distance=150, leader_safety_horizon=10.
 python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3  --obstacle_count 2
 
 # Main experiment multi-difficulty test
@@ -38,6 +39,19 @@ python main_SAC_curriculum.py --experiment_type no_attention --test --no_render 
 
 # No-curriculum test. If --model_path is omitted, the latest no_curriculum model is selected automatically.
 python main_SAC_curriculum.py --experiment_type no_curriculum --test --no_render --test_episodes 100
+
+# Leader predictive safety shield sensitivity test.
+# This fixes the trained policy and sweeps shield-off, default, safe distance, warning distance, and prediction horizon.
+python main_SAC_curriculum.py --experiment_type curriculum --safety_sensitivity_test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3 --obstacle_count 2
+
+# Custom safety shield sensitivity ranges.
+python main_SAC_curriculum.py --experiment_type curriculum --safety_sensitivity_test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3 --obstacle_count 2 --safe_distance_values 25,35,45,55,65 --warning_distance_values 80,120,150,180,220 --horizon_values 2,4,6,8,10
+
+# Single test with Leader safety shield disabled.
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3 --obstacle_count 2 --disable_leader_safety_shield
+
+# Single test with the final recommended Leader safety shield setting.
+python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --test_episodes 100 --hero_count 1 --enemy_count 3 --obstacle_count 2 --leader_safe_distance 45 --leader_warning_distance 150 --leader_safety_horizon 10
 
 # Explicit model path example
 python main_SAC_curriculum.py --experiment_type curriculum --test --no_render --model_path outputs/train/curriculum/<run_dir>/training_runs/<train_run>/models/final/final_model_<timestamp>

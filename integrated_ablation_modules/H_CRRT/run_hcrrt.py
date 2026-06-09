@@ -31,6 +31,12 @@ from integrated_ablation_modules.H_CRRT.tracking import LeaderTracker, FollowerT
 from integrated_ablation_modules.H_CRRT.io_utils import save_results, ensure_dir
 
 
+MAIN_METRIC_STYLE = "main_SAC_curriculum_monte_carlo"
+DEFAULT_PREDEFINED_POSITIONS = {
+    "goals": [(500, 200)],
+}
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -101,6 +107,34 @@ def _extract_final_distance(distance_info) -> float:
     return 0.0
 
 
+def _is_current_step_in_formation(env, distance_threshold: float = 50.0) -> bool:
+    entity_manager = getattr(env, "entity_manager", None)
+    if entity_manager is None or not entity_manager.leaders or not entity_manager.followers:
+        return False
+
+    leader = entity_manager.leaders[0]
+    if hasattr(leader, "is_alive") and not leader.is_alive():
+        return False
+
+    for follower in entity_manager.followers:
+        if hasattr(follower, "is_alive") and not follower.is_alive():
+            return False
+        if follower.distance_to(leader) >= distance_threshold:
+            return False
+    return True
+
+
+def _metric_stats(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return {"mean": 0.0, "std": 0.0, "values": []}
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "values": [float(v) for v in arr],
+    }
+
+
 def _pump_pygame_events(render_enabled: bool) -> None:
     """Pump pygame events to prevent window from becoming unresponsive.
 
@@ -120,7 +154,7 @@ def main():
     ap = argparse.ArgumentParser("H-CRRT baseline runner")
     ap.add_argument("--hero_count", type=int, default=1)
     ap.add_argument("--enemy_count", type=int, default=3)
-    ap.add_argument("--obstacle_count", type=int, default=3)
+    ap.add_argument("--obstacle_count", type=int, default=2)
     ap.add_argument("--test_episodes", type=int, default=20)
     # default True with explicit disabling flags
     ap.add_argument("--use_formation", dest="use_formation", action="store_true")
@@ -152,6 +186,7 @@ def main():
         follower_count=args.enemy_count,
         obstacle_num=args.obstacle_count,
         render=args.render,
+        predefined_positions=DEFAULT_PREDEFINED_POSITIONS,
     ).unwrapped
 
     env.set_time_step(args.dt)
@@ -167,9 +202,12 @@ def main():
     rewards_all = []
     steps_all = []
     formation_rates_all = []
+    formation_window_rates_all = []
     final_dist_all = []
     path_len_all = []
     energy_all = []
+    actual_path_len_all = []
+    energy_integral_dt_all = []
     avg_abs_omega_all = []
     planning_time_all = []
     waypoint_count_all = []
@@ -215,8 +253,11 @@ def main():
         total_steps = 0
         total_path_len = 0.0
         total_energy = 0.0
+        total_actual_path_len = 0.0
+        total_energy_integral_dt = 0.0
         omega_abs_sum = 0.0
         omega_count = 0
+        team_formation_time = 0
         formation_window_hits = 0
         formation_samples = 0
         win = False
@@ -273,21 +314,28 @@ def main():
                 r_sum += float(reward)
             total_reward += r_sum
 
-            # path length increment from actual displacement
-            total_path_len += _euclid(prev_leader_pos, current_leader_pos)
+            if _is_current_step_in_formation(env):
+                team_formation_time += 1
 
-            # energy integral with de-normalized commands and dt
-            # leader
+            # path length increment from actual displacement
+            # Align primary J_S with main_SAC_curriculum.py: sum current leader speed per step.
+            total_path_len += float(getattr(leader, "speed", 0.0))
+            # Keep the physical displacement path as a diagnostic field.
+            total_actual_path_len += _euclid(prev_leader_pos, current_leader_pos)
+
+            # Align primary J_C with main_SAC_curriculum.py: leader normalized action effort.
+            total_energy += abs(float(aL)) + abs(float(phiL))
+
+            # Keep the previous dt-integrated, de-normalized control effort separately.
             a_cmd_L = float(aL) * 0.3
             omega_cmd_L = float(phiL) * 0.6
-            total_energy += (abs(a_cmd_L) + abs(omega_cmd_L)) * float(args.dt)
+            total_energy_integral_dt += (abs(a_cmd_L) + abs(omega_cmd_L)) * float(args.dt)
             omega_abs_sum += abs(omega_cmd_L)
             omega_count += 1
-            # followers
             for a_norm, phi_norm in actions["followers"]:
                 a_cmd_F = float(a_norm) * 0.6
                 omega_cmd_F = float(phi_norm) * 1.2
-                total_energy += (abs(a_cmd_F) + abs(omega_cmd_F)) * float(args.dt)
+                total_energy_integral_dt += (abs(a_cmd_F) + abs(omega_cmd_F)) * float(args.dt)
 
             # Periodic or deviation-triggered replan if enabled.
             should_replan = args.replan_horizon > 0 and (total_steps % args.replan_horizon == 0)
@@ -312,37 +360,64 @@ def main():
         rewards_all.append(total_reward)
         steps_all.append(total_steps)
         final_dist_all.append(_extract_final_distance(dis))
+        formation_rates_all.append(team_formation_time / float(total_steps) if total_steps > 0 else 0.0)
         if args.use_formation and formation_samples > 0:
-            formation_rates_all.append(formation_window_hits / float(formation_samples))
+            formation_window_rates_all.append(formation_window_hits / float(formation_samples))
         else:
-            formation_rates_all.append(float("nan"))
+            formation_window_rates_all.append(float("nan"))
         path_len_all.append(total_path_len)
         energy_all.append(total_energy)
+        actual_path_len_all.append(total_actual_path_len)
+        energy_integral_dt_all.append(total_energy_integral_dt)
         avg_abs_omega_all.append(omega_abs_sum / float(max(1, omega_count)))
         planning_time_all.append(planning_time)
 
     # aggregate
     success_rate = wins / float(args.test_episodes)
+    set_score = success_rate * float(np.mean(steps_all))
+    path_stats = _metric_stats(path_len_all)
+    energy_stats = _metric_stats(energy_all)
     results = {
         "test_episodes": args.test_episodes,
+        "metric_style": MAIN_METRIC_STYLE,
         "success_rate": success_rate,
-        "rewards": {"mean": float(np.mean(rewards_all)), "std": float(np.std(rewards_all))},
-        "steps": {"mean": float(np.mean(steps_all)), "std": float(np.std(steps_all))},
+        "rewards": _metric_stats(rewards_all),
+        "steps": _metric_stats(steps_all),
+        "set_score": {
+            "value": float(set_score),
+            "success_rate": float(success_rate),
+            "avg_exploration_time": float(np.mean(steps_all)),
+        },
         "formation_rates": {
             "mean": float(np.nanmean(formation_rates_all)) if any(not np.isnan(x) for x in formation_rates_all) else 0.0,
             "std": float(np.nanstd(formation_rates_all)) if any(not np.isnan(x) for x in formation_rates_all) else 0.0,
+            "values": [float(x) for x in formation_rates_all],
         },
-        "distances": {"mean": float(np.mean(final_dist_all)), "std": float(np.std(final_dist_all))},
-        "path_length": {"mean": float(np.mean(path_len_all)), "std": float(np.std(path_len_all))},
-        "energy": {"mean": float(np.mean(energy_all)), "std": float(np.std(energy_all))},
-        "avg_abs_omega": {"mean": float(np.mean(avg_abs_omega_all)), "std": float(np.std(avg_abs_omega_all))},
-        "planning_time": {"mean": float(np.mean(planning_time_all)), "std": float(np.std(planning_time_all))},
-        "path_waypoints": {"mean": float(np.mean(waypoint_count_all)), "std": float(np.std(waypoint_count_all))},
+        "formation_window_rates": {
+            "mean": float(np.nanmean(formation_window_rates_all)) if any(not np.isnan(x) for x in formation_window_rates_all) else 0.0,
+            "std": float(np.nanstd(formation_window_rates_all)) if any(not np.isnan(x) for x in formation_window_rates_all) else 0.0,
+            "values": [float(x) for x in formation_window_rates_all],
+        },
+        "distances": _metric_stats(final_dist_all),
+        "trajectory_lengths": path_stats,
+        "energy_consumptions": energy_stats,
+        "path_length": path_stats,
+        "energy": energy_stats,
+        "actual_path_length": _metric_stats(actual_path_len_all),
+        "energy_integral_dt": _metric_stats(energy_integral_dt_all),
+        "avg_abs_omega": _metric_stats(avg_abs_omega_all),
+        "planning_time": _metric_stats(planning_time_all),
+        "path_waypoints": _metric_stats(waypoint_count_all),
         "test_config": {
             "hero_count": args.hero_count,
             "enemy_count": args.enemy_count,
             "obstacle_count": args.obstacle_count,
             "uav_speed": None,
+            "seed": args.seed,
+            "dt": args.dt,
+            "metric_style": MAIN_METRIC_STYLE,
+            "formation_metric_style": "all_followers_distance_lt_50_per_step",
+            "predefined_positions": DEFAULT_PREDEFINED_POSITIONS,
             "rrt_step_size": args.rrt_step_size,
             "rrt_goal_bias": args.rrt_goal_bias,
             "rrt_max_nodes": args.rrt_max_nodes,
@@ -383,7 +458,8 @@ def calculate_five_metrics(results):
     fkr_std = fkr_data["std"] if not np.isnan(fkr_data["std"]) else 0.0
     
     # 3. 成功率加权探索时间(SET)
-    set_score = mcr * results["steps"]["mean"]
+    avg_steps = results["steps"]["mean"]
+    set_score = results.get("set_score", {}).get("value", mcr * avg_steps)
     
     # 4. 飞行轨迹(J_S) 
     js_mean = results["path_length"]["mean"]
@@ -397,6 +473,7 @@ def calculate_five_metrics(results):
         "mcr": mcr,
         "fkr": {"mean": fkr_mean, "std": fkr_std},
         "set": set_score,
+        "avg_steps": avg_steps,
         "js": {"mean": js_mean, "std": js_std},
         "jc": {"mean": jc_mean, "std": jc_std}
     }
@@ -406,7 +483,7 @@ def print_five_metrics(metrics):
     print("\n五指标性能评估:")
     print(f"1. 任务完成率(MCR): {metrics['mcr']:.2f}")
     print(f"2. 编队保持率(FKR): {metrics['fkr']['mean']:.2f}±{metrics['fkr']['std']:.2f}")
-    print(f"3. 成功率加权探索时间(SET): {metrics['set']:.2f} (SR: {metrics['mcr']:.2f} × 平均时间: {metrics['set']/max(metrics['mcr'], 0.01):.2f})")
+    print(f"3. 成功率加权探索时间(SET): {metrics['set']:.2f} (SR: {metrics['mcr']:.2f} × 平均时间: {metrics['avg_steps']:.2f})")
     print(f"4. 飞行轨迹(J_S): {metrics['js']['mean']:.2f}±{metrics['js']['std']:.2f}")
     print(f"5. 能量消耗(J_C): {metrics['jc']['mean']:.2f}±{metrics['jc']['std']:.2f}")
 

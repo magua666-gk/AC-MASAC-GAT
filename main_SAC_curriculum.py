@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import json
+import math
 import uuid
 import random
 from visualization.matplotlib_fonts import configure_matplotlib_fonts
@@ -1853,6 +1854,48 @@ def is_current_step_in_formation(env, distance_threshold=50.0):
     return True
 
 
+def _metric_stats(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return {"mean": 0.0, "std": 0.0, "values": [], "count": 0}
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "values": [float(value) for value in arr],
+        "count": int(arr.size),
+    }
+
+
+def _count_values(values):
+    counts = {}
+    for value in values:
+        key = str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _extract_leader_goal_distance(distance_info, env=None):
+    if isinstance(distance_info, dict) and "leader_to_goal" in distance_info:
+        return float(distance_info["leader_to_goal"])
+
+    entity_manager = getattr(env, "entity_manager", None) if env is not None else None
+    if entity_manager is None or not entity_manager.leaders or not entity_manager.goals:
+        return None
+
+    leader = entity_manager.leaders[0]
+    goal = entity_manager.goals[0]
+    return float(leader.distance_to(goal))
+
+
+def _get_leader_position(env):
+    entity_manager = getattr(env, "entity_manager", None)
+    if entity_manager is None or not entity_manager.leaders:
+        return None
+
+    leader = entity_manager.leaders[0]
+    return float(leader.pos_x), float(leader.pos_y)
+
+
 def _sum_reward_values(reward):
     total = 0.0
     if isinstance(reward, dict):
@@ -3430,6 +3473,19 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     uav_speed = test_options.get('uav_speed', None)
     hero_count = test_options.get('hero_count', 1)
     enemy_count = test_options.get('enemy_count', 3) 
+    stagnation_window = int(test_options.get('stagnation_window', 120))
+    stagnation_min_progress = float(test_options.get('stagnation_min_progress', 5.0))
+    stagnation_min_motion_since_progress = float(test_options.get('stagnation_min_motion_since_progress', 40.0))
+    stagnation_hard_window = int(test_options.get('stagnation_hard_window', 600))
+    stuck_window = int(test_options.get('stuck_window', 40))
+    stuck_movement_epsilon = float(test_options.get('stuck_movement_epsilon', 0.2))
+    leader_safety_shield = bool(test_options.get('leader_safety_shield', True))
+    leader_safe_distance = float(test_options.get('leader_safe_distance', 45.0))
+    leader_warning_distance = float(test_options.get('leader_warning_distance', 150.0))
+    leader_safety_horizon = int(test_options.get('leader_safety_horizon', 10))
+    safety_near_miss_distance = float(test_options.get('safety_near_miss_distance', 40.0))
+    raw_safety_config_name = str(test_options.get('safety_config_name', '') or '').strip()
+    safety_config_name = _safe_experiment_name(raw_safety_config_name) if raw_safety_config_name else ''
         
     print(f"开始蒙特卡洛测试，测试回合数: {test_episodes}")
     print(f"加载模型: {model_path}")
@@ -3451,13 +3507,23 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     env.set_time_step(0.1)
     print(f"测试模式：时间步长dt设置为1")
 
-    # 测试阶段启用 Leader safety shield
+    # 测试阶段按配置启用或关闭 Leader safety shield
     if hasattr(env, "entity_manager"):
-        env.entity_manager.enable_leader_safety_shield = True
-        env.entity_manager.leader_safe_distance = 45.0
-        env.entity_manager.leader_warning_distance = 150.0
-        env.entity_manager.leader_safety_horizon = 6
-        print("[Test] Leader safety shield enabled.")
+        env.entity_manager.enable_leader_safety_shield = leader_safety_shield
+        env.entity_manager.leader_safe_distance = leader_safe_distance
+        env.entity_manager.leader_warning_distance = leader_warning_distance
+        env.entity_manager.leader_safety_horizon = leader_safety_horizon
+        if hasattr(env.entity_manager, "reset_leader_safety_stats"):
+            env.entity_manager.reset_leader_safety_stats()
+        if leader_safety_shield:
+            print(
+                "[Test] Leader safety shield enabled: "
+                f"safe_distance={leader_safe_distance}, "
+                f"warning_distance={leader_warning_distance}, "
+                f"horizon={leader_safety_horizon}"
+            )
+        else:
+            print("[Test] Leader safety shield disabled.")
     
     if hasattr(env, 'entity_manager') and hasattr(env.entity_manager, 'images_loaded'):
         env.entity_manager.images_loaded = False
@@ -3482,6 +3548,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     rewards = []
     steps = []
     formation_rates = []
+    raw_formation_rates = []
+    success_formation_rates = []
     distance_metrics = {
         "leader_to_goal": [],
         "leader_to_follower": [],
@@ -3489,6 +3557,14 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     }
     trajectory_lengths = []  # 飞行轨迹长度列表
     energy_consumptions = []  # 能量消耗列表
+    raw_trajectory_lengths = []
+    raw_energy_consumptions = []
+    success_steps = []
+    terminal_reasons = []
+    episode_records = []
+    safety_near_miss_count = 0
+    safety_obstacle_distance_samples = []
+    episode_min_obstacle_distances = []
     
     # 初始化编队数据收集结构
     formation_data = {
@@ -3516,6 +3592,12 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         step_count = 0
         team_formation_time = 0
         last_distance = None
+        terminal_reason = "running"
+        best_goal_distance = _extract_leader_goal_distance(None, env)
+        no_progress_steps = 0
+        low_movement_steps = 0
+        movement_since_goal_progress = 0.0
+        previous_leader_position = _get_leader_position(env)
         
         # 初始化当前回合的数据收集
         episode_formation_data = {
@@ -3526,6 +3608,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         
         episode_trajectory_length = 0.0  # 当前回合轨迹长度
         episode_energy_consumption = 0.0  # 当前回合能量消耗
+        episode_min_obstacle_distance = float("inf")
         
         while not done and step_count < EP_LEN:
             # 收集当前时间步的编队状态数据
@@ -3559,6 +3642,13 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             
             # 记录最后一步的距离
             last_distance = dis
+            if isinstance(dis, dict) and "leader_to_obstacle" in dis:
+                leader_to_obstacle = float(dis["leader_to_obstacle"])
+                if math.isfinite(leader_to_obstacle):
+                    safety_obstacle_distance_samples.append(leader_to_obstacle)
+                    episode_min_obstacle_distance = min(episode_min_obstacle_distance, leader_to_obstacle)
+                    if leader_to_obstacle < safety_near_miss_distance:
+                        safety_near_miss_count += 1
             
             # 更新状态和统计
            # 更新状态和统计
@@ -3594,11 +3684,60 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             # 计算编队时间
             if is_current_step_in_formation(env):
                 team_formation_time += 1
+
+            current_goal_distance = _extract_leader_goal_distance(dis, env)
+            current_leader_position = _get_leader_position(env)
+            current_step_movement = None
+
+            if current_leader_position is not None and previous_leader_position is not None:
+                current_step_movement = math.hypot(
+                    current_leader_position[0] - previous_leader_position[0],
+                    current_leader_position[1] - previous_leader_position[1],
+                )
+                movement_since_goal_progress += current_step_movement
+
+                if current_step_movement <= stuck_movement_epsilon:
+                    low_movement_steps += 1
+                else:
+                    low_movement_steps = 0
+            previous_leader_position = current_leader_position
+
+            if current_goal_distance is not None:
+                if best_goal_distance is None or current_goal_distance < best_goal_distance - stagnation_min_progress:
+                    best_goal_distance = current_goal_distance
+                    no_progress_steps = 0
+                    movement_since_goal_progress = 0.0
+                else:
+                    no_progress_steps += 1
+
+            soft_no_progress_stagnation = (
+                no_progress_steps >= stagnation_window
+                and movement_since_goal_progress < stagnation_min_motion_since_progress
+            )
+            hard_no_progress_stagnation = (
+                stagnation_hard_window > 0
+                and no_progress_steps >= stagnation_hard_window
+            )
+
+            if done:
+                terminal_reason = "success" if win else "environment_failure"
+            elif soft_no_progress_stagnation:
+                terminal_reason = "stagnation_no_goal_progress"
+                done = True
+            elif hard_no_progress_stagnation:
+                terminal_reason = "stagnation_long_no_goal_progress"
+                done = True
+            elif low_movement_steps >= stuck_window:
+                terminal_reason = "stagnation_low_movement"
+                done = True
             
             # 渲染环境
             if RENDER:
                 env.render()
         
+        if terminal_reason == "running":
+            terminal_reason = "timeout" if step_count >= EP_LEN and not win else ("success" if win else "unknown_failure")
+
         # 完成当前回合的数据收集
         if collect_formation_data and episode_formation_data:
             # 计算回合级别的编队质量指标
@@ -3612,13 +3751,17 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                         formation_errors.append(follower['formation_distance_error'])
                 
                 avg_formation_error = np.mean(formation_errors) if formation_errors else 0.0
+                raw_episode_formation_rate = team_formation_time / step_count if step_count > 0 else 0.0
+                adjusted_episode_formation_rate = raw_episode_formation_rate if win else 0.0
                 
                 episode_formation_data['episode_summary'] = {
                     'total_steps': len(timesteps_data),
-                    'formation_rate': team_formation_time / step_count if step_count > 0 else 0,
+                    'formation_rate': adjusted_episode_formation_rate,
+                    'raw_formation_rate': raw_episode_formation_rate,
                     'avg_formation_error': float(avg_formation_error),
                     'total_reward': float(total_reward),
-                    'success': bool(win)
+                    'success': bool(win),
+                    'terminal_reason': terminal_reason,
                 }
             
             formation_data['episodes'].append(episode_formation_data)
@@ -3627,10 +3770,17 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         win_count += int(win)
         rewards.append(total_reward)
         steps.append(step_count)
+        terminal_reasons.append(terminal_reason)
+        if math.isfinite(episode_min_obstacle_distance):
+            episode_min_obstacle_distances.append(episode_min_obstacle_distance)
         
-        # 计算这一回合的编队保持率
-        formation_rate = team_formation_time / step_count if step_count > 0 else 0
+        # 计算这一回合的编队保持率。失败回合不再贡献正向FKR，避免卡墙刷高编队率。
+        raw_formation_rate = team_formation_time / step_count if step_count > 0 else 0
+        formation_rate = raw_formation_rate if win else 0.0
         formation_rates.append(formation_rate)
+        raw_formation_rates.append(raw_formation_rate)
+        if win:
+            success_formation_rates.append(raw_formation_rate)
         
         # 记录最终距离
         if last_distance is not None:
@@ -3649,14 +3799,33 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                 if "leader_to_obstacle" in last_distance:
                     distance_metrics["leader_to_obstacle"].append(float(last_distance["leader_to_obstacle"]))
         
-        # 存储轨迹长度和能量消耗
-        trajectory_lengths.append(episode_trajectory_length)
-        energy_consumptions.append(episode_energy_consumption)
+        # 存储轨迹长度和能量消耗。主J_S/J_C只统计成功回合，raw保留所有回合。
+        raw_trajectory_lengths.append(episode_trajectory_length)
+        raw_energy_consumptions.append(episode_energy_consumption)
+        if win:
+            trajectory_lengths.append(episode_trajectory_length)
+            energy_consumptions.append(episode_energy_consumption)
+            success_steps.append(step_count)
+
+        episode_records.append({
+            "episode_id": episode,
+            "success": bool(win),
+            "terminal_reason": terminal_reason,
+            "steps": int(step_count),
+            "reward": float(total_reward),
+            "formation_rate": float(formation_rate),
+            "raw_formation_rate": float(raw_formation_rate),
+            "trajectory_length": float(episode_trajectory_length),
+            "energy_consumption": float(episode_energy_consumption),
+            "min_leader_obstacle_distance": float(episode_min_obstacle_distance) if math.isfinite(episode_min_obstacle_distance) else None,
+            "no_progress_steps": int(no_progress_steps),
+            "movement_since_goal_progress": float(movement_since_goal_progress),
+        })
         
         # 输出回合信息
         status = "成功" if win else "失败"
         print(f"测试回合 {episode+1}/{test_episodes}, 状态: {status}, 奖励: {total_reward:.1f}, "
-              f"步数: {step_count}, 编队率: {formation_rate:.2f}")
+              f"步数: {step_count}, 编队率: {formation_rate:.2f}, 终止原因: {terminal_reason}")
     
     # 计算编队数据的汇总统计
     if collect_formation_data and formation_data:
@@ -3704,6 +3873,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     std_steps = np.std(steps)
     avg_formation_rate = np.mean(formation_rates)
     std_formation_rate = np.std(formation_rates)
+    terminal_reason_counts = _count_values(terminal_reasons)
     
     # 计算最终距离的平均值和标准差
     distance_stats = {
@@ -3720,6 +3890,30 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     std_trajectory_length = np.std(trajectory_lengths) if trajectory_lengths else 0
     avg_energy_consumption = np.mean(energy_consumptions) if energy_consumptions else 0
     std_energy_consumption = np.std(energy_consumptions) if energy_consumptions else 0
+    raw_trajectory_stats = _metric_stats(raw_trajectory_lengths)
+    raw_energy_stats = _metric_stats(raw_energy_consumptions)
+    raw_formation_stats = _metric_stats(raw_formation_rates)
+    success_step_stats = _metric_stats(success_steps)
+    success_formation_stats = _metric_stats(success_formation_rates)
+    safety_obstacle_distance_stats = _metric_stats(safety_obstacle_distance_samples)
+    episode_min_obstacle_distance_stats = _metric_stats(episode_min_obstacle_distances)
+    safety_filter_stats = {}
+    if hasattr(env, "entity_manager") and hasattr(env.entity_manager, "get_leader_safety_stats"):
+        safety_filter_stats = env.entity_manager.get_leader_safety_stats()
+    safety_sample_count = len(safety_obstacle_distance_samples)
+    near_miss_rate = safety_near_miss_count / safety_sample_count if safety_sample_count else 0.0
+    safety_metrics = {
+        "leader_safety_shield_enabled": bool(leader_safety_shield),
+        "leader_safe_distance": float(leader_safe_distance),
+        "leader_warning_distance": float(leader_warning_distance),
+        "leader_safety_horizon": int(leader_safety_horizon),
+        "near_miss_distance": float(safety_near_miss_distance),
+        "near_miss_count": int(safety_near_miss_count),
+        "near_miss_rate": float(near_miss_rate),
+        "leader_to_obstacle_distances": safety_obstacle_distance_stats,
+        "episode_min_leader_obstacle_distances": episode_min_obstacle_distance_stats,
+        "shield_filter": safety_filter_stats,
+    }
     
     # 计算成功率加权探索时间(SET)
     set_score = success_rate * avg_steps
@@ -3729,9 +3923,24 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     print(f"测试回合数: {test_episodes}")
     print(f"1. 任务完成率(MCR): {success_rate:.2f}")
     print(f"2. 编队保持率(FKR): {avg_formation_rate:.2f}±{std_formation_rate:.2f}")
+    print(
+        f"2b. 成功回合编队保持率(FKR_success_only): "
+        f"{success_formation_stats['mean']:.2f}±{success_formation_stats['std']:.2f} "
+        f"(count: {success_formation_stats['count']})"
+    )
     print(f"3. 成功率加权探索时间(SET): {set_score:.2f} (SR: {success_rate:.2f} × 平均时间: {avg_steps:.2f})")
     print(f"4. 飞行轨迹(J_S): {avg_trajectory_length:.2f}±{std_trajectory_length:.2f}")
     print(f"5. 能量消耗(J_C): {avg_energy_consumption:.2f}±{std_energy_consumption:.2f}")
+    print(f"成功回合数: {win_count}/{test_episodes}, 终止原因统计: {terminal_reason_counts}")
+    print(f"Raw J_S/J_C(含失败诊断): {raw_trajectory_stats['mean']:.2f}±{raw_trajectory_stats['std']:.2f}, "
+          f"{raw_energy_stats['mean']:.2f}±{raw_energy_stats['std']:.2f}")
+    print(
+        "Leader安全屏蔽: "
+        f"enabled={leader_safety_shield}, "
+        f"intervention_rate={safety_filter_stats.get('intervention_rate', 0.0):.3f}, "
+        f"mean_action_delta={safety_filter_stats.get('mean_action_delta', 0.0):.3f}, "
+        f"near_miss_rate={near_miss_rate:.3f}"
+    )
     print(f"平均奖励: {avg_reward:.2f}±{std_reward:.2f}")
     print(
         "平均最终距离: "
@@ -3764,23 +3973,67 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "std": float(std_formation_rate),
             "values": [float(f) for f in formation_rates]
         },
+        "success_formation_rates": success_formation_stats,
         "distances": distance_stats,
         "trajectory_lengths": {
             "mean": float(avg_trajectory_length),
             "std": float(std_trajectory_length),
-            "values": [float(t) for t in trajectory_lengths]
+            "values": [float(t) for t in trajectory_lengths],
+            "count": len(trajectory_lengths)
         },
         "energy_consumptions": {
             "mean": float(avg_energy_consumption),
             "std": float(std_energy_consumption),
-            "values": [float(e) for e in energy_consumptions]
+            "values": [float(e) for e in energy_consumptions],
+            "count": len(energy_consumptions)
+        },
+        "success_metrics": {
+            "success_count": int(win_count),
+            "steps": success_step_stats,
+            "formation_rates": success_formation_stats,
+            "trajectory_lengths": _metric_stats(trajectory_lengths),
+            "energy_consumptions": _metric_stats(energy_consumptions),
+        },
+        "raw_metrics": {
+            "formation_rates": raw_formation_stats,
+            "trajectory_lengths": raw_trajectory_stats,
+            "energy_consumptions": raw_energy_stats,
+        },
+        "safety_metrics": safety_metrics,
+        "terminal_reason_counts": terminal_reason_counts,
+        "episode_records": episode_records,
+        "metric_policy": {
+            "formation_rates": "failure_adjusted_zero_for_failed_episodes",
+            "success_formation_rates": "computed_over_successful_episodes_only_failed_episodes_excluded",
+            "trajectory_lengths": "success_only_primary_with_raw_metrics_preserved",
+            "energy_consumptions": "success_only_primary_with_raw_metrics_preserved",
+            "stagnation_cutoff_enabled": True,
+            "stagnation_window": stagnation_window,
+            "stagnation_min_progress": stagnation_min_progress,
+            "stagnation_min_motion_since_progress": stagnation_min_motion_since_progress,
+            "stagnation_hard_window": stagnation_hard_window,
+            "stuck_window": stuck_window,
+            "stuck_movement_epsilon": stuck_movement_epsilon,
         },
         "test_config": {
             "hero_count": hero_count,
             "enemy_count": enemy_count,
             "obstacle_count": obstacle_count,
             "uav_speed": uav_speed,
-            "seed": seed
+            "seed": seed,
+            "safety_config_name": safety_config_name,
+            "stagnation_window": int(stagnation_window),
+            "stagnation_min_progress": float(stagnation_min_progress),
+            "stagnation_min_motion_since_progress": float(stagnation_min_motion_since_progress),
+            "stagnation_hard_window": int(stagnation_hard_window),
+            "stuck_window": int(stuck_window),
+            "stuck_movement_epsilon": float(stuck_movement_epsilon),
+            "leader_safety_shield": bool(leader_safety_shield),
+            "leader_safe_distance": float(leader_safe_distance),
+            "leader_warning_distance": float(leader_warning_distance),
+            "leader_safety_horizon": int(leader_safety_horizon),
+            "safety_near_miss_distance": float(safety_near_miss_distance),
+            "metric_policy": "failure_adjusted_with_success_only_costs"
         },
         "timestamp": time.time()
     }
@@ -3794,6 +4047,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     config_str = f"_h{hero_count}_e{enemy_count}_o{obstacle_count}"
     if uav_speed:
         config_str += f"_s{int(uav_speed)}"
+    if safety_config_name:
+        config_str += f"_{safety_config_name}"
     
     # 创建保存目录
     test_dir_name = f"single_test_{timestamp}{config_str}"
@@ -3826,11 +4081,17 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         "avg_reward": float(avg_reward),
         "avg_steps": float(avg_steps),
         "formation_rate": float(avg_formation_rate),
+        "success_formation_rate": float(success_formation_stats["mean"]),
         "metrics": {
             "MCR": float(success_rate),
             "FKR": {
                 "mean": float(avg_formation_rate),
                 "std": float(std_formation_rate)
+            },
+            "FKR_success_only": {
+                "mean": float(success_formation_stats["mean"]),
+                "std": float(success_formation_stats["std"]),
+                "count": int(success_formation_stats["count"])
             },
             "SET": {
                 "value": float(set_score),
@@ -3845,6 +4106,29 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                 "mean": float(avg_energy_consumption),
                 "std": float(std_energy_consumption)
             },
+            "success_metrics": {
+                "success_count": int(win_count),
+                "steps": success_step_stats,
+                "formation_rates": success_formation_stats,
+                "trajectory_lengths": {
+                    "mean": float(avg_trajectory_length),
+                    "std": float(std_trajectory_length),
+                    "count": len(trajectory_lengths)
+                },
+                "energy_consumptions": {
+                    "mean": float(avg_energy_consumption),
+                    "std": float(std_energy_consumption),
+                    "count": len(energy_consumptions)
+                }
+            },
+            "raw_metrics": {
+                "formation_rates": raw_formation_stats,
+                "trajectory_lengths": raw_trajectory_stats,
+                "energy_consumptions": raw_energy_stats
+            },
+            "safety_metrics": safety_metrics,
+            "terminal_reason_counts": terminal_reason_counts,
+            "metric_policy": results["metric_policy"],
             "avg_reward": {
                 "mean": float(avg_reward),
                 "std": float(std_reward)
@@ -3907,12 +4191,13 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     # 绘制测试奖励分布直方图
     try:
         import matplotlib.pyplot as plt
+        histogram_bins = max(1, min(20, test_episodes // 5))
         
         plt.figure(figsize=(12, 8))
         
         # 奖励分布直方图
         plt.subplot(2, 2, 1)
-        plt.hist(rewards, bins=min(20, test_episodes//5), alpha=0.7)
+        plt.hist(rewards, bins=histogram_bins, alpha=0.7)
         plt.title('奖励分布')
         plt.xlabel('奖励')
         plt.ylabel('频次')
@@ -3921,7 +4206,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         
         # 步数分布直方图
         plt.subplot(2, 2, 2)
-        plt.hist(steps, bins=min(20, test_episodes//5), alpha=0.7)
+        plt.hist(steps, bins=histogram_bins, alpha=0.7)
         plt.title('步数分布')
         plt.xlabel('步数')
         plt.ylabel('频次')
@@ -3930,7 +4215,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         
         # 编队率分布直方图
         plt.subplot(2, 2, 3)
-        plt.hist(formation_rates, bins=min(20, test_episodes//5), alpha=0.7)
+        plt.hist(formation_rates, bins=histogram_bins, alpha=0.7)
         plt.title('编队保持率分布')
         plt.xlabel('编队保持率')
         plt.ylabel('频次')
@@ -3944,7 +4229,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                 values = metric_stats["values"]
                 if not values:
                     continue
-                plt.hist(values, bins=min(20, test_episodes//5), alpha=0.45, label=metric_name)
+                plt.hist(values, bins=histogram_bins, alpha=0.45, label=metric_name)
                 plt.axvline(
                     metric_stats["mean"],
                     linestyle='dashed',
@@ -4070,9 +4355,9 @@ def analyze_test_results(result_files=None, base_path=None):
     
     # 分析和比较测试结果
     print("\n测试结果比较:")
-    print("-" * 80)
-    print(f"{'配置信息':^40} | {'成功率':^10} | {'平均奖励':^15} | {'平均步数':^15} | {'编队率':^15}")
-    print("-" * 80)
+    print("-" * 98)
+    print(f"{'配置信息':^40} | {'成功率':^10} | {'平均奖励':^15} | {'平均步数':^15} | {'编队率':^15} | {'成功FKR':^15}")
+    print("-" * 98)
     
     for result in test_results:
         config = result.get('test_config', {})
@@ -4097,11 +4382,15 @@ def analyze_test_results(result_files=None, base_path=None):
         steps_std = result.get('steps', {}).get('std', 0)
         formation_mean = result.get('formation_rates', {}).get('mean', 0)
         formation_std = result.get('formation_rates', {}).get('std', 0)
+        success_formation = result.get('success_formation_rates') or result.get('success_metrics', {}).get('formation_rates', {})
+        success_formation_mean = success_formation.get('mean', 0)
+        success_formation_std = success_formation.get('std', 0)
         
         print(f"{config_str:40} | {success_rate:10.2f} | {reward_mean:6.2f}±{reward_std:6.2f} | "
-              f"{steps_mean:6.2f}±{steps_std:6.2f} | {formation_mean:6.2f}±{formation_std:6.2f}")
+              f"{steps_mean:6.2f}±{steps_std:6.2f} | {formation_mean:6.2f}±{formation_std:6.2f} | "
+              f"{success_formation_mean:6.2f}±{success_formation_std:6.2f}")
     
-    print("-" * 80)
+    print("-" * 98)
     
     # 绘制对比图表
     try:
@@ -4114,6 +4403,7 @@ def analyze_test_results(result_files=None, base_path=None):
         reward_stds = []
         steps_means = []
         formation_means = []
+        success_formation_means = []
         
         for result in test_results:
             config = result.get('test_config', {})
@@ -4136,6 +4426,8 @@ def analyze_test_results(result_files=None, base_path=None):
             reward_stds.append(result.get('rewards', {}).get('std', 0))
             steps_means.append(result.get('steps', {}).get('mean', 0))
             formation_means.append(result.get('formation_rates', {}).get('mean', 0))
+            success_formation = result.get('success_formation_rates') or result.get('success_metrics', {}).get('formation_rates', {})
+            success_formation_means.append(success_formation.get('mean', 0))
         
         # 绘制成功率对比
         plt.subplot(2, 2, 1)
@@ -4161,11 +4453,15 @@ def analyze_test_results(result_files=None, base_path=None):
         
         # 绘制编队率对比
         plt.subplot(2, 2, 4)
-        plt.bar(labels, formation_means, alpha=0.7)
+        x = np.arange(len(labels))
+        width = 0.38
+        plt.bar(x - width / 2, formation_means, width=width, alpha=0.7, label='总体FKR')
+        plt.bar(x + width / 2, success_formation_means, width=width, alpha=0.7, label='成功FKR')
         plt.title('编队保持率对比')
         plt.ylabel('编队保持率')
-        plt.xticks(rotation=45)
+        plt.xticks(x, labels, rotation=45)
         plt.ylim(0, 1.1)
+        plt.legend()
         
         plt.tight_layout()
         plt.suptitle('测试结果比较', fontsize=16)
@@ -4267,6 +4563,8 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         print(f"平均奖励: {result['rewards']['mean']:.2f}±{result['rewards']['std']:.2f}")
         print(f"平均步数: {result['steps']['mean']:.2f}±{result['steps']['std']:.2f}")
         print(f"平均编队率: {result['formation_rates']['mean']:.2f}±{result['formation_rates']['std']:.2f}")
+        success_formation = result.get('success_formation_rates') or result.get('success_metrics', {}).get('formation_rates', {})
+        print(f"成功回合编队率: {success_formation.get('mean', 0):.2f}±{success_formation.get('std', 0):.2f}")
         print(f"平均路径效率: {1.0 / result['steps']['mean']:.4f}")
         print(f"平均碰撞率: {1.0 - result['success_rate']:.2f}")
     
@@ -4276,16 +4574,18 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
     print(f"{'='*60}\n")
     
     print("各难度级别测试结果汇总:")
-    print(f"{'难度级别':^12} | {'成功率':^8} | {'平均奖励':^15} | {'平均步数':^15} | {'编队率':^15}")
-    print("-" * 75)
+    print(f"{'难度级别':^12} | {'成功率':^8} | {'平均奖励':^15} | {'平均步数':^15} | {'编队率':^15} | {'成功FKR':^15}")
+    print("-" * 93)
     
     for level_idx, (level_name, level_result) in enumerate(all_results.items()):
+        success_formation = level_result.get('success_formation_rates') or level_result.get('success_metrics', {}).get('formation_rates', {})
         print(f"{level_name:^12} | {level_result['success_rate']:8.2f} | "
               f"{level_result['rewards']['mean']:6.2f}±{level_result['rewards']['std']:6.2f} | "
               f"{level_result['steps']['mean']:6.2f}±{level_result['steps']['std']:6.2f} | "
-              f"{level_result['formation_rates']['mean']:6.2f}±{level_result['formation_rates']['std']:6.2f}")
+              f"{level_result['formation_rates']['mean']:6.2f}±{level_result['formation_rates']['std']:6.2f} | "
+              f"{success_formation.get('mean', 0):6.2f}±{success_formation.get('std', 0):6.2f}")
     
-    print("-" * 75)
+    print("-" * 93)
     
     # 绘制不同难度级别的对比图表
     try:
@@ -4301,6 +4601,14 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
         step_stds = [all_results[level]['steps']['std'] for level in levels]
         formation_rates = [all_results[level]['formation_rates']['mean'] for level in levels]
         formation_stds = [all_results[level]['formation_rates']['std'] for level in levels]
+        success_formation_rates = [
+            (all_results[level].get('success_formation_rates') or all_results[level].get('success_metrics', {}).get('formation_rates', {})).get('mean', 0)
+            for level in levels
+        ]
+        success_formation_stds = [
+            (all_results[level].get('success_formation_rates') or all_results[level].get('success_metrics', {}).get('formation_rates', {})).get('std', 0)
+            for level in levels
+        ]
         
         # 计算路径效率和碰撞率
         path_efficiencies = [1.0 / step if step > 0 else 0 for step in steps]
@@ -4329,11 +4637,19 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
             axes[0, 2].text(i, v + 2, f'{v:.2f}', ha='center')
         
         # 编队率
-        axes[1, 0].bar(levels, formation_rates, color='purple', yerr=formation_stds, capsize=5)
+        x = np.arange(len(levels))
+        width = 0.38
+        axes[1, 0].bar(x - width / 2, formation_rates, width=width, color='purple', yerr=formation_stds, capsize=5, label='总体FKR')
+        axes[1, 0].bar(x + width / 2, success_formation_rates, width=width, color='mediumpurple', yerr=success_formation_stds, capsize=5, label='成功FKR')
         axes[1, 0].set_title('编队保持率')
+        axes[1, 0].set_xticks(x)
+        axes[1, 0].set_xticklabels(levels)
         axes[1, 0].set_ylim(0, 1.0)
         for i, v in enumerate(formation_rates):
-            axes[1, 0].text(i, v + 0.02, f'{v:.2f}', ha='center')
+            axes[1, 0].text(i - width / 2, v + 0.02, f'{v:.2f}', ha='center')
+        for i, v in enumerate(success_formation_rates):
+            axes[1, 0].text(i + width / 2, v + 0.02, f'{v:.2f}', ha='center')
+        axes[1, 0].legend()
         
         # 路径效率
         axes[1, 1].bar(levels, path_efficiencies, color='teal')
@@ -4473,14 +4789,19 @@ def _resolve_model_path(model_path=None, experiment_type="curriculum"):
         should_auto_search = True
 
     if should_auto_search:
-        search_roots.extend([
-            os.path.join("outputs", "train", safe_experiment),
-            os.path.join("outputs", "train"),
-        ])
+        experiment_train_root = os.path.join("outputs", "train", safe_experiment)
+        search_roots.append(experiment_train_root)
         resolved = _find_latest_model_file(search_roots)
         if resolved:
             if model_path != resolved:
-                print(f"自动选择最新模型文件: {resolved}")
+                print(f"自动选择最新{safe_experiment}模型文件: {resolved}")
+            return resolved
+
+        fallback_root = os.path.join("outputs", "train")
+        resolved = _find_latest_model_file([fallback_root])
+        if resolved:
+            if model_path != resolved:
+                print(f"未在 {experiment_train_root} 找到模型，回退选择最新模型文件: {resolved}")
             return resolved
 
     return model_path
@@ -4614,6 +4935,214 @@ def _delegate_integrated_experiment(experiment_type, original_argv):
     finally:
         sys.argv = old_argv
 
+
+def _parse_sweep_values(raw_values, cast_type, fallback):
+    if raw_values is None or str(raw_values).strip() == "":
+        return list(fallback)
+    values = []
+    for item in str(raw_values).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(cast_type(item))
+    return values or list(fallback)
+
+
+def _common_test_options_from_args(args, n_agent, m_enemy):
+    return {
+        'hero_count': n_agent,
+        'enemy_count': m_enemy,
+        'obstacle_count': args.obstacle_count,
+        'uav_speed': args.test_speed,
+        'stagnation_window': args.stagnation_window,
+        'stagnation_min_progress': args.stagnation_min_progress,
+        'stagnation_min_motion_since_progress': args.stagnation_min_motion_since_progress,
+        'stagnation_hard_window': args.stagnation_hard_window,
+        'stuck_window': args.stuck_window,
+        'stuck_movement_epsilon': args.stuck_movement_epsilon,
+        'leader_safety_shield': not args.disable_leader_safety_shield,
+        'leader_safe_distance': args.leader_safe_distance,
+        'leader_warning_distance': args.leader_warning_distance,
+        'leader_safety_horizon': args.leader_safety_horizon,
+        'safety_near_miss_distance': args.safety_near_miss_distance,
+    }
+
+
+def _append_unique_safety_config(configs, seen_names, name, enabled, safe_distance, warning_distance, horizon):
+    safe_name = _safe_experiment_name(name)
+    if safe_name in seen_names:
+        return
+    seen_names.add(safe_name)
+    configs.append({
+        "name": safe_name,
+        "leader_safety_shield": bool(enabled),
+        "leader_safe_distance": float(safe_distance),
+        "leader_warning_distance": float(warning_distance),
+        "leader_safety_horizon": int(horizon),
+    })
+
+
+def _build_safety_sensitivity_configs(args):
+    safe_values = _parse_sweep_values(args.safe_distance_values, float, [25, 35, 45, 55, 65])
+    warning_values = _parse_sweep_values(args.warning_distance_values, float, [80, 120, 150, 180, 220])
+    horizon_values = _parse_sweep_values(args.horizon_values, int, [2, 4, 6, 8, 10])
+
+    base_safe = float(args.leader_safe_distance)
+    base_warning = float(args.leader_warning_distance)
+    base_horizon = int(args.leader_safety_horizon)
+
+    configs = []
+    seen_names = set()
+
+    _append_unique_safety_config(
+        configs, seen_names, "shield_off",
+        False, base_safe, base_warning, base_horizon
+    )
+    _append_unique_safety_config(
+        configs, seen_names, f"default_sd{base_safe:g}_wd{base_warning:g}_h{base_horizon}",
+        True, base_safe, base_warning, base_horizon
+    )
+
+    for value in safe_values:
+        if abs(float(value) - base_safe) < 1e-9:
+            continue
+        _append_unique_safety_config(
+            configs, seen_names, f"safe_distance_{float(value):g}",
+            True, float(value), base_warning, base_horizon
+        )
+
+    for value in warning_values:
+        if abs(float(value) - base_warning) < 1e-9:
+            continue
+        _append_unique_safety_config(
+            configs, seen_names, f"warning_distance_{float(value):g}",
+            True, base_safe, float(value), base_horizon
+        )
+
+    for value in horizon_values:
+        if int(value) == base_horizon:
+            continue
+        _append_unique_safety_config(
+            configs, seen_names, f"horizon_{int(value)}",
+            True, base_safe, base_warning, int(value)
+        )
+
+    return configs
+
+
+def run_safety_sensitivity_test(model_path, test_episodes, base_test_options, experiment_type="curriculum", seed=None, configs=None):
+    """Run single-factor Leader safety shield sensitivity tests."""
+    configs = configs or []
+    if not configs:
+        raise ValueError("安全屏蔽敏感性实验没有可运行的配置")
+
+    resolved_model_path = _resolve_model_path(model_path, experiment_type)
+    if not resolved_model_path or not os.path.isfile(resolved_model_path):
+        default_train_root = os.path.join("outputs", "train", _safe_experiment_name(experiment_type))
+        raise FileNotFoundError(
+            f"找不到模型文件: {resolved_model_path or '未指定'}。"
+            f"请传入具体模型文件，或确保 {default_train_root} 下存在模型。"
+        )
+
+    timestamp = get_timestamp()
+    all_results = {}
+    summary_rows = []
+
+    print("\n启动主机预测安全屏蔽敏感性实验")
+    print(f"模型: {resolved_model_path}")
+    print(f"每组测试回合数: {test_episodes}")
+    print(f"配置数量: {len(configs)}")
+
+    for idx, cfg in enumerate(configs, start=1):
+        options = dict(base_test_options)
+        options.update(cfg)
+        options["safety_config_name"] = cfg["name"]
+
+        print(f"\n[{idx}/{len(configs)}] 安全配置: {cfg['name']}")
+        print(
+            f"  enabled={cfg['leader_safety_shield']}, "
+            f"safe_distance={cfg['leader_safe_distance']}, "
+            f"warning_distance={cfg['leader_warning_distance']}, "
+            f"horizon={cfg['leader_safety_horizon']}"
+        )
+
+        result = run_monte_carlo_test(
+            model_path=resolved_model_path,
+            test_episodes=test_episodes,
+            test_options=options,
+            experiment_type=experiment_type,
+            seed=seed
+        )
+        result["safety_sensitivity_config"] = cfg
+        all_results[cfg["name"]] = result
+
+        success_formation = result.get("success_formation_rates") or result.get("success_metrics", {}).get("formation_rates", {})
+        safety_metrics = result.get("safety_metrics", {})
+        shield_stats = safety_metrics.get("shield_filter", {})
+        summary_rows.append({
+            "name": cfg["name"],
+            "leader_safety_shield": cfg["leader_safety_shield"],
+            "leader_safe_distance": cfg["leader_safe_distance"],
+            "leader_warning_distance": cfg["leader_warning_distance"],
+            "leader_safety_horizon": cfg["leader_safety_horizon"],
+            "MCR": float(result.get("success_rate", 0.0)),
+            "FKR": float(result.get("formation_rates", {}).get("mean", 0.0)),
+            "FKR_success_only": float(success_formation.get("mean", 0.0)),
+            "SET": float(result.get("set_score", {}).get("value", 0.0)),
+            "J_S": float(result.get("trajectory_lengths", {}).get("mean", 0.0)),
+            "J_C": float(result.get("energy_consumptions", {}).get("mean", 0.0)),
+            "shield_intervention_rate": float(shield_stats.get("intervention_rate", 0.0)),
+            "mean_action_delta": float(shield_stats.get("mean_action_delta", 0.0)),
+            "near_miss_rate": float(safety_metrics.get("near_miss_rate", 0.0)),
+            "terminal_reason_counts": result.get("terminal_reason_counts", {}),
+        })
+
+    print("\n安全屏蔽敏感性实验汇总:")
+    print("-" * 132)
+    print(f"{'配置':^28} | {'MCR':^6} | {'FKR':^6} | {'成功FKR':^8} | {'SET':^8} | {'J_S':^9} | {'J_C':^8} | {'干预率':^8} | {'动作改变量':^10} | {'近失率':^8}")
+    print("-" * 132)
+    for row in summary_rows:
+        print(
+            f"{row['name']:^28} | "
+            f"{row['MCR']:6.2f} | {row['FKR']:6.2f} | {row['FKR_success_only']:8.2f} | "
+            f"{row['SET']:8.2f} | {row['J_S']:9.2f} | {row['J_C']:8.2f} | "
+            f"{row['shield_intervention_rate']:8.3f} | {row['mean_action_delta']:10.3f} | "
+            f"{row['near_miss_rate']:8.3f}"
+        )
+    print("-" * 132)
+
+    summary = {
+        "timestamp": timestamp,
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "experiment_type": experiment_type,
+        "model_path": resolved_model_path,
+        "test_episodes": int(test_episodes),
+        "seed": seed,
+        "base_test_options": base_test_options,
+        "configs": configs,
+        "summary_rows": summary_rows,
+    }
+
+    ensure_dir_exists(TEST_RESULTS_BASE)
+    summary_json_path = os.path.join(TEST_RESULTS_BASE, _timestamped_filename("safety_sensitivity_summary", ".json", timestamp))
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(convert_to_json_compatible(summary), f, ensure_ascii=False, indent=4)
+
+    summary_pkl_path = os.path.join(TEST_RESULTS_BASE, _timestamped_filename("safety_sensitivity_summary", ".pkl", timestamp))
+    with open(summary_pkl_path, "wb") as f:
+        pkl.dump(summary, f, pkl.HIGHEST_PROTOCOL)
+
+    all_results_pkl_path = os.path.join(TEST_RESULTS_BASE, _timestamped_filename("safety_sensitivity_all_results", ".pkl", timestamp))
+    with open(all_results_pkl_path, "wb") as f:
+        pkl.dump(all_results, f, pkl.HIGHEST_PROTOCOL)
+
+    print(f"安全屏蔽敏感性实验JSON汇总已保存到: {summary_json_path}")
+    print(f"安全屏蔽敏感性实验PKL汇总已保存到: {summary_pkl_path}")
+    print(f"安全屏蔽敏感性完整结果PKL已保存到: {all_results_pkl_path}")
+    create_test_results_index()
+    return summary
+
+
 def main():
     """主函数
     """
@@ -4653,6 +5182,36 @@ def main():
                        help='测试时使用的障碍物数量，默认为2')
     parser.add_argument('--test_speed', type=float, default=None,
                        help='测试时使用的无人机速度，不设置则使用默认速度')
+    parser.add_argument('--stagnation_window', type=int, default=120,
+                       help='软停滞检测窗口；仅在窗口内无目标进展且累计移动不足阈值时判停，默认120')
+    parser.add_argument('--stagnation_min_progress', type=float, default=5.0,
+                       help='判定目标距离有有效进展的最小改善量，默认5')
+    parser.add_argument('--stagnation_min_motion_since_progress', type=float, default=40.0,
+                       help='软停滞窗口内允许继续绕障的最小累计位移；低于该值才判无目标进展停滞，默认40')
+    parser.add_argument('--stagnation_hard_window', type=int, default=600,
+                       help='长时间无目标进展硬保护窗口；设为0可关闭，默认600')
+    parser.add_argument('--stuck_window', type=int, default=40,
+                       help='低位移卡住检测窗口，默认40')
+    parser.add_argument('--stuck_movement_epsilon', type=float, default=0.2,
+                       help='单步位移小于该值计为低移动，默认0.2')
+    parser.add_argument('--disable_leader_safety_shield', action='store_true',
+                       help='测试阶段关闭主机预测安全屏蔽')
+    parser.add_argument('--leader_safe_distance', type=float, default=45.0,
+                       help='主机预测安全屏蔽的安全距离，默认45')
+    parser.add_argument('--leader_warning_distance', type=float, default=150.0,
+                       help='主机预测安全屏蔽的预警距离，默认150')
+    parser.add_argument('--leader_safety_horizon', type=int, default=10,
+                       help='主机预测安全屏蔽的预测步长，默认10')
+    parser.add_argument('--safety_near_miss_distance', type=float, default=40.0,
+                       help='near-miss统计阈值，主机到障碍物距离低于该值计为近失，默认40')
+    parser.add_argument('--safety_sensitivity_test', action='store_true',
+                       help='运行主机预测安全屏蔽参数敏感性测试')
+    parser.add_argument('--safe_distance_values', type=str, default='25,35,45,55,65',
+                       help='安全距离敏感性扫描列表，逗号分隔，默认25,35,45,55,65')
+    parser.add_argument('--warning_distance_values', type=str, default='80,120,150,180,220',
+                       help='预警距离敏感性扫描列表，逗号分隔，默认80,120,150,180,220')
+    parser.add_argument('--horizon_values', type=str, default='2,4,6,8,10',
+                       help='预测步长敏感性扫描列表，逗号分隔，默认2,4,6,8,10')
     # 添加多难度测试选项
     parser.add_argument('--multi_difficulty_test', action='store_true',
                        help='在多个难度级别上进行蒙特卡洛测试')
@@ -4696,7 +5255,7 @@ def main():
         args.use_curriculum = True
     elif args.experiment_type == 'no_curriculum':
         args.use_curriculum = False
-    mode = 'test' if (args.test or args.multi_difficulty_test) else 'train'
+    mode = 'test' if (args.test or args.multi_difficulty_test or args.safety_sensitivity_test) else 'train'
     if args.results_dir is None:
         args.results_dir = _make_timestamped_results_dir(args.experiment_type, mode)
     _register_run_timer(args.results_dir, args.experiment_type, mode)
@@ -4742,7 +5301,7 @@ def main():
     # 设置渲染标志：测试时默认渲染，训练时固定关闭渲染
     if args.no_render:
         RENDER = False
-    elif args.test or args.multi_difficulty_test:
+    elif args.test or args.multi_difficulty_test or args.safety_sensitivity_test:
         RENDER = True
     else:
         RENDER = False
@@ -4763,7 +5322,21 @@ def main():
     import main_SAC
     main_SAC.action_number = action_number
     
-    if args.multi_difficulty_test:
+    if args.safety_sensitivity_test:
+        print(f"启动主机预测安全屏蔽敏感性测试模式: 友方={n_agent}, 敌方={m_enemy}, 障碍物={args.obstacle_count}")
+        if args.test_speed:
+            print(f"指定无人机速度: {args.test_speed}")
+        base_test_options = _common_test_options_from_args(args, n_agent, m_enemy)
+        configs = _build_safety_sensitivity_configs(args)
+        run_safety_sensitivity_test(
+            model_path=args.model_path,
+            test_episodes=args.test_episodes or TEST_EPIOSDE,
+            base_test_options=base_test_options,
+            experiment_type=args.experiment_type,
+            seed=args.seed,
+            configs=configs
+        )
+    elif args.multi_difficulty_test:
         # 多难度测试模式
         print("启动多难度蒙特卡洛测试模式")
         # 设置难度级别配置
@@ -4775,7 +5348,11 @@ def main():
                 custom_difficulties = [int(d) for d in args.test_difficulty.split(',')]
                 print(f"使用自定义难度级别: {custom_difficulties}")
                 difficulty_levels = [
-                    {'obstacle_count': d, 'uav_speed': args.test_speed or 1.0}
+                    {
+                        **_common_test_options_from_args(args, n_agent, m_enemy),
+                        'obstacle_count': d,
+                        'uav_speed': args.test_speed or 1.0
+                    }
                     for d in custom_difficulties
                 ]
             except ValueError:
@@ -4791,7 +5368,11 @@ def main():
             obstacle_counts = [int(1 + i * step) for i in range(int((max_obstacle - 1) / step) + 1)]
             
             difficulty_levels = [
-                {'obstacle_count': d, 'uav_speed': args.test_speed or 1.0}
+                {
+                    **_common_test_options_from_args(args, n_agent, m_enemy),
+                    'obstacle_count': d,
+                    'uav_speed': args.test_speed or 1.0
+                }
                 for d in obstacle_counts
             ]
         
@@ -4814,12 +5395,7 @@ def main():
             print(f"指定无人机速度: {args.test_speed}")
         
         # 设置测试选项
-        test_options = {
-            'hero_count': n_agent, # 使用 n_agent
-            'enemy_count': m_enemy, # 使用 m_enemy
-            'obstacle_count': args.obstacle_count,
-            'uav_speed': args.test_speed
-        }
+        test_options = _common_test_options_from_args(args, n_agent, m_enemy)
         
         # 运行测试
         run_monte_carlo_test(
